@@ -1,5 +1,5 @@
 #------------------------------------------------------------------------------#
-# Functions to retrieve data from the NOBV database
+# Retrieve data from the NOBV database
 #------------------------------------------------------------------------------#
 
 library(dbplyr)

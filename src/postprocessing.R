@@ -96,7 +96,7 @@ fit_gpp_curve <- function(data) {
 }
 
 # Import Kljun model
-source('src/FFP_R/calc_footprint_FFP_climatology.R')
+source('src/calc_footprint_FFP_climatology.R')
 #------------------------------------------------------------------------------#
 # Postprocessing class
 #------------------------------------------------------------------------------#
@@ -132,30 +132,32 @@ Postprocessing <- setRefClass(
       conn <- dbConnect(RSQLite::SQLite(), db)
       
       df <- tbl(conn, 'data') %>% 
-        select(datetime, name, val) %>% 
-        filter(name %in% default_variables,
-               datetime >= start_date,
-               datetime <= end_date) %>% 
-        collect() %>% 
-        type_convert()
+        select(datetime, all_of(variable_list)) %>% 
+        # select(datetime, name, val) %>% 
+        # filter(name %in% default_variables,
+        #        datetime >= start_date,
+        #        datetime <= end_date) %>% 
+        collect()
+        # type_convert()
       
       dbDisconnect(conn)
       
       # Pivot to wide format
-      df <- df %>% 
-        # Remove duplicate entries
-        group_by(datetime, name) %>% 
-        mutate(n = n()) %>% 
-        filter(n == 1) %>% 
-        ungroup() %>%
-        # Pivot
-        pivot_wider(id_cols = datetime,
-                    names_from = name,
-                    values_from = val)
+      # df <- df %>% 
+      #   # Remove duplicate entries
+      #   group_by(datetime, name) %>% 
+      #   mutate(n = n()) %>% 
+      #   filter(n == 1) %>% 
+      #   ungroup() %>%
+      #   # Pivot
+      #   pivot_wider(id_cols = datetime,
+      #               names_from = name,
+      #               values_from = val)
       
       # Add NEE, night time and month columns
       df <- df %>%
-        mutate(NEE = FC + SC_SINGLE,
+        mutate(datetime = as_datetime(datetime, tz='UTC'),
+               NEE = FC + SC_SINGLE,
                night = MT1_SWIN_1_H_180 < 10,
                month = month(datetime))
       
@@ -179,12 +181,12 @@ Postprocessing <- setRefClass(
     {
       # Filter the co2 data for outliers, friction velocity and quality flags
       
-      variable <- c('FC', 'NEE')
+      variables <- c('FC', 'NEE')
       # Ustar filtering
       # The ustar filtering can be improved to account of seasons / literature
       # 0.1 was chosen by Hidde as it removed most bad data, but some stuff still gets through
       data <<- data %>% 
-        mutate(across(variable, ~if_else(USTAR < ustar_threshold, NaN, .x)))
+        mutate(across(all_of(variables), ~if_else(USTAR < ustar_threshold, NaN, .x)))
       
       # Quality flag filtering, possible to also add 1 if you want to be strict
       # Flags
@@ -193,13 +195,13 @@ Postprocessing <- setRefClass(
       # 2 is bad
       # Can customise flagging system in EddyPro
       data <<- data %>% 
-        mutate(across(variable, ~if_else(FC_flag > 1, NaN, .x)))
+        mutate(across(all_of(variables), ~if_else(FC_flag > 1, NaN, .x)))
       
       # Filter outliers
       # Note: To be replace with robust outlier detection
       data <<- data %>% 
-        mutate(across(variable, ~if_else(FC > quantile(FC, 0.97, na.rm=TRUE), NaN, .x)),
-               across(variable, ~if_else(FC < quantile(FC, 0.01, na.rm=TRUE), NaN, .x)))
+        mutate(across(all_of(variables), ~if_else(FC > quantile(FC, 0.97, na.rm=TRUE), NaN, .x)),
+               across(all_of(variables), ~if_else(FC < quantile(FC, 0.01, na.rm=TRUE), NaN, .x)))
     },
     filter_ch4 = function()
     {

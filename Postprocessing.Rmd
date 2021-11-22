@@ -1,0 +1,140 @@
+---
+title: "Postprocessing"
+author: "Alexander Buzacott"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(dbplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(DBI)
+library(raster, exclude = 'select')
+library(lubridate)
+library(randomForest)
+library(tictoc)
+
+theme_set(theme_bw())
+
+source('src/postprocessing.R')
+```
+
+# Postprocessing class
+
+```{r}
+# Set the start and end date to postprocess
+start_date <- '2021-09-01'
+end_date <- '2021-10-01'
+
+pp = Postprocessing()
+pp$load_data(start_date,
+             end_date,
+             db='data/Sample.db')
+
+glimpse(pp$data)
+```
+
+# Data filtering
+
+```{r}
+pp$filter_co2()
+pp$filter_ch4()
+```
+
+# Partition fluxes
+
+```{r}
+pp$flux_partitioning()
+```
+
+# Gapfilling
+
+## CO2
+
+### Using a neural network
+
+```{r}
+pp$gapfilling_nn()
+```
+
+## CH4
+
+### Using Random Forest
+
+```{r}
+pp$gapfill_ch4_rf()
+```
+
+### Training and testing performance
+
+```{r}
+pp$data %>% 
+  filter(RF_src %in% c('train', 'test')) %>% 
+  ggplot(aes(FCH4, FCH4_GF_RF, col=RF_src)) + 
+  geom_point() +
+  geom_abline() +
+  labs(x = 'Obs', y='Sim')
+```
+
+### Summary statistics
+
+```{r}
+pp$data %>% 
+  filter(RF_src %in% c('train', 'test')) %>% 
+  select(RF_src, FCH4, FCH4_GF_RF) %>% 
+  group_by(RF_src) %>% 
+  summarise(n = n(),
+            RMSE = sqrt( mean( (FCH4-FCH4_GF_RF), na.rm=TRUE)^2 ),
+            R2 = cor(FCH4, FCH4_GF_RF, use='pairwise.complete.obs'),
+            LCCC = DescTools::CCC(FCH4, FCH4_GF_RF, na.rm=TRUE)$rho.c$est) %>% 
+  mutate(across(is.numeric, round, 2))
+```
+
+# Contribution class
+
+Create an instance of the class
+
+```{r}
+cb = Contribution(data = pp$data,
+                  latitude = 52.14,
+                  xy = c(117467, 461350),
+                  shapefile = 'data/geodata/zegveld_perceel.gpkg')
+```
+
+```{r}
+cb$calculate_contribution(parallel=TRUE)
+```
+
+```{r}
+pp$data = pp$data %>% 
+  mutate(Contribution = cb$cdata$Contribution)
+
+pp$data %>% 
+  select(Contribution, FCH4, FC) %>% 
+  pivot_longer(-Contribution) %>% 
+  ggplot(aes(Contribution, value)) +
+  geom_point() +
+  facet_wrap(~name, scales='free_y')
+```
+# Contribution timeseries
+
+Get a raster brick of the contribution timesteps
+
+```{r}
+cb$calculate_footprint_timeseries(parallel = TRUE)
+```
+
+Plot a timestep 
+
+```{r}
+rasterVis::gplot(cb$fp_ts[[1]]) +
+  geom_raster(aes(fill=value)) +
+  scale_fill_gradientn(colours = terrain.colors(7, rev=TRUE)) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0))
+```
