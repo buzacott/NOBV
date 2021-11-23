@@ -26,62 +26,80 @@ source('src/postprocessing.R')
 
 # Postprocessing class
 
+This document demonstrates the functions in the `Postprocessing()` class. The 
+class methods can be viewed in `src/postprocessing.R`.
+
+First set the start and end dates to extract from the example database.
+
 ```{r}
 # Set the start and end date to postprocess
-start_date <- '2021-09-01'
-end_date <- '2021-10-01'
+start_dt <- as_datetime('2021-09-01T00:00:00', tz='UTC')
+end_dt   <- as_datetime('2021-10-01T00:00:00', tz='UTC')
 
+db_path <- 'data/Sample.db'
+
+# Create the class and load the data
 pp = Postprocessing()
-pp$load_data(start_date,
-             end_date,
-             db='data/Sample.db')
+pp$load_data(start_dt, end_dt, db=db_path)
 
 glimpse(pp$data)
 ```
 
-# Data filtering
+## Data filtering
+
+At the moment filtering is only done using Eddy Pro quality flags (QC flag == 1)
+and then outlier exclusion using simple quantile methods.
 
 ```{r}
 pp$filter_co2()
 pp$filter_ch4()
 ```
 
-# Partition fluxes
+## Partition flux
 
 ```{r}
-pp$flux_partitioning()
+pp$flux_partitioning(plot=TRUE)
 ```
 
-# Gapfilling
+## Gapfilling
 
-## CO2
+### CO2
 
-### Using a neural network
+Non-linear regression and neural network approaches.
 
 ```{r}
+pp$gapfilling_nlr()
 pp$gapfilling_nn()
 ```
 
-## CH4
+```{r}
+pp$data %>% 
+  select(datetime, NEE, FC_GF_NLR, FC_GF_NN) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value, col=name)) +
+  geom_line()
+```
 
-### Using Random Forest
+### CH4
+
+Random Forest
 
 ```{r}
 pp$gapfill_ch4_rf()
 ```
 
-### Training and testing performance
+Training and testing performance
 
 ```{r}
 pp$data %>% 
   filter(RF_src %in% c('train', 'test')) %>% 
-  ggplot(aes(FCH4, FCH4_GF_RF, col=RF_src)) + 
+  ggplot(aes(FCH4, FCH4_RF, col=RF_src)) + 
   geom_point() +
   geom_abline() +
-  labs(x = 'Obs', y='Sim')
+  labs(x = 'Obs', y='Sim', col=NULL)
 ```
 
-### Summary statistics
+Summary statistics
 
 ```{r}
 pp$data %>% 
@@ -91,50 +109,81 @@ pp$data %>%
   summarise(n = n(),
             RMSE = sqrt( mean( (FCH4-FCH4_GF_RF), na.rm=TRUE)^2 ),
             R2 = cor(FCH4, FCH4_GF_RF, use='pairwise.complete.obs'),
-            LCCC = DescTools::CCC(FCH4, FCH4_GF_RF, na.rm=TRUE)$rho.c$est) %>% 
-  mutate(across(is.numeric, round, 2))
+            LCCC = DescTools::CCC(FCH4, FCH4_GF_RF, na.rm=TRUE)$rho.c$est)# %>% 
+  # mutate(across(where(is.numeric), round, 2))
+```
+
+```{r}
+ggplot(pp$data) +
+  geom_line(aes(datetime, FCH4_GF_RF, col='FCH4_GF_RF')) +
+  geom_line(aes(datetime, FCH4, col='FCH4')) +
+  labs(y = expression(value~'('*µmol.s^-1*.m^-2*')'), col=NULL)
 ```
 
 # Contribution class
 
-Create an instance of the class
+This class uses the [Kljun et al. (2015)](https://doi.org/10.5194/gmd-8-3695-2015) 
+model to calculate the flux footprint. 
+
+Methods are available to calculate the percent contribution within area of
+interest and to return a timeseries raster brick.
 
 ```{r}
+source('src/postprocessing.R')
 cb = Contribution(data = pp$data,
-                  latitude = 52.14,
                   xy = c(117467, 461350),
+                  epsg = 28992,
                   shapefile = 'data/geodata/zegveld_perceel.gpkg')
 ```
 
+
 ```{r}
-cb$calculate_contribution(parallel=TRUE)
+# The number of cores to use can be specified with parallel
+cb$calculate_contribution(parallel=4)
 ```
 
-```{r}
-pp$data = pp$data %>% 
-  mutate(Contribution = cb$cdata$Contribution)
+### Plot of contribution vs flux
 
+```{r, warning=FALSE}
 pp$data %>% 
+  mutate(Contribution = cb$cdata$Contribution) %>% 
   select(Contribution, FCH4, FC) %>% 
   pivot_longer(-Contribution) %>% 
   ggplot(aes(Contribution, value)) +
   geom_point() +
   facet_wrap(~name, scales='free_y')
 ```
-# Contribution timeseries
 
-Get a raster brick of the contribution timesteps
+### Contribution timeseries
 
-```{r}
-cb$calculate_footprint_timeseries(parallel = TRUE)
+Calling `calculate_contribution` also stores a raster brick with the
+contribution timesteps, however it can also be run using:
+
+```{r, eval=FALSE}
+cb$calculate_footprints()
+# With parallel processing
+cb$calculate_footprints(parallel=4)
 ```
 
 Plot a timestep 
 
 ```{r}
-rasterVis::gplot(cb$fp_ts[[1]]) +
+rasterVis::gplot(cb$footprints[[1]]) +
   geom_raster(aes(fill=value)) +
   scale_fill_gradientn(colours = terrain.colors(7, rev=TRUE)) +
   scale_y_continuous(expand = c(0,0)) +
-  scale_x_continuous(expand = c(0,0))
+  scale_x_continuous(expand = c(0,0)) +
+  ggtitle(names(cb$footprints[[1]]))
+```
+
+# Upload to database
+
+Updates the database with some of the variables calculated e.g., NEE, GPP, 
+gap-filled series, contribution.
+
+```{r}
+pp$data <- pp$data %>% 
+  mutate(Contribution = cb$cdata$Contribution)
+
+pp$upload_data(db=db_path)
 ```

@@ -13,6 +13,7 @@ library(ggplot2)
 library(raster, exclude = 'select')
 library(lubridate)
 library(randomForest)
+library(sf)
 library(doParallel)
 # Import Python libraries via reticulate for neural network gapfilling
 # Comment out or ignore if you don't want to setup reticulate or use neural
@@ -119,9 +120,10 @@ Postprocessing <- setRefClass(
       
       db_location <<- file.path('data', 'sample.db')
     },
-    load_data = function(start_date, end_date, db = NULL, variable_list = NULL)
+    load_data = function(start_dt, end_dt, db = NULL, variable_list = NULL)
     {
-      # Check to see if there is a given list of variables, otherwise use default variables
+      # Check to see if there is a given list of variables, otherwise use default
+      # variables
       if(is.null(variable_list)) {
         variable_list <- default_variables
       }
@@ -129,37 +131,23 @@ Postprocessing <- setRefClass(
         db <- db_location
       }
 
-      conn <- dbConnect(RSQLite::SQLite(), db)
-      
-      df <- tbl(conn, 'data') %>% 
-        select(datetime, all_of(variable_list)) %>% 
-        # select(datetime, name, val) %>% 
-        # filter(name %in% default_variables,
-        #        datetime >= start_date,
-        #        datetime <= end_date) %>% 
-        collect()
-        # type_convert()
-      
-      dbDisconnect(conn)
-      
-      # Pivot to wide format
-      # df <- df %>% 
-      #   # Remove duplicate entries
-      #   group_by(datetime, name) %>% 
-      #   mutate(n = n()) %>% 
-      #   filter(n == 1) %>% 
-      #   ungroup() %>%
-      #   # Pivot
-      #   pivot_wider(id_cols = datetime,
-      #               names_from = name,
-      #               values_from = val)
-      
-      # Add NEE, night time and month columns
-      df <- df %>%
+      con <- dbConnect(RSQLite::SQLite(), db)
+      id_name <- tbl(con, 'id_name')
+      df <- tbl(con, 'data') %>% 
+        left_join(id_name) %>% 
+        filter(name %in% !!variable_list,
+               datetime >= !!as.integer(start_dt),
+               datetime <= !!as.integer(end_dt)) %>% 
+        select(datetime, name, value) %>% 
+        collect() %>% 
+        # Pivot to wide format
+        pivot_wider(id_col=datetime, names_from=name, values_from=value) %>% 
+        # Add NEE, night time and month columns
         mutate(datetime = as_datetime(datetime, tz='UTC'),
                NEE = FC + SC_SINGLE,
                night = MT1_SWIN_1_H_180 < 10,
-               month = month(datetime))
+               month = month(datetime),
+               FCH4 = FCH4 / 1000) # nmol/s/m2 -> µmol/s/m2
       
       # Rename columns
       df <- df %>% 
@@ -242,7 +230,8 @@ Postprocessing <- setRefClass(
         select(-data) %>% 
         unnest(variables)
       
-      #Fill up empty season with averages and calculate respiration for whole dataset
+      # Fill up empty season with averages and calculate respiration for whole
+      # dataset
       data <<- data %>% 
         left_join(variables) %>% 
         mutate(across(c(r_ref, r_param), ~replace_na(.x, mean(.x))),
@@ -270,6 +259,21 @@ Postprocessing <- setRefClass(
         left_join(variables) %>% 
         mutate(across(c(beta1, beta2), ~replace_na(.x, mean(.x))),
                GPP = gpp(SWIN, beta1, beta2))
+      
+      if(plot) {
+        data %>% 
+          select(datetime, NEE, GPP, Respiration) %>% 
+          pivot_longer(-datetime) %>% 
+          ggplot(aes(datetime, value, col=name)) +
+          geom_line() +
+          labs(y = expression(value~'('*µmol.s^-1*.m^-2*')'))
+      }
+    },
+    gapfilling_nlr = function(plot = FALSE)
+    {
+      data <<- data %>% 
+        mutate(nlr_NEE = Respiration + GPP,
+               FC_GF_NLR = if_else(is.na(NEE), nlr_NEE, NEE))
     },
     gapfilling_nn = function(plot = FALSE)
     {
@@ -409,22 +413,70 @@ Postprocessing <- setRefClass(
       predict_data = data %>%
         select(datetime, all_of(training_variables)) %>%
         drop_na() %>%
-        mutate(FCH4_GF_RF = predict(rf, newdata=.))
+        mutate(FCH4_RF = predict(rf, newdata=.))
       
-      # Join back and fill in final missing NaN values with linear interp
+      # Join back and fill in final missing values (missing predictor data)
+      # with linear interp
       data <<- data %>% 
-        left_join(predict_data %>% select(datetime, FCH4_GF_RF)) %>%
+        left_join(predict_data %>% select(datetime, FCH4_RF)) %>%
         mutate(RF_src = ifelse(datetime %in% training_data$datetime, 'train',
                                ifelse(datetime %in% test_data$datetime, 'test',
-                                      ifelse(is.na(FCH4_GF_RF), 'GF-lm', 'GF-rf'))),
-               RF_src = factor(RF_src, levels = c('train', 'test', 'GF-rf', 'GF-lm'))) %>% 
-        mutate(FCH4_GF_RF = zoo::na.approx(FCH4_GF_RF, na.rm=FALSE))
+                                      ifelse(is.na(FCH4_RF), 'GF-lm', 'GF-rf'))),
+               RF_src = factor(RF_src,
+                               levels = c('train', 'test', 'GF-rf', 'GF-lm'))) %>% 
+        mutate(FCH4_RF = zoo::na.approx(FCH4_RF, na.rm=FALSE),
+               FCH4_GF_RF = if_else(is.na(FCH4), FCH4_RF, FCH4))
       
       if(plot) {
         ggplot(data) +
           geom_line(aes(datetime, FCH4, col='obs')) + 
           geom_line(aes(datetime, FCH4_GF_RF, col='GF RF')) 
       }
+    },
+    upload_data = function(db, variables) {
+      if(missing(db)) {
+        stop('Missing path to db')
+      }
+      if(missing(variables)) {
+        variables = c('NEE', 'GPP', 'Respiration', 'FC_GF_NLR', 'FC_GF_NN',
+                      'FCH4_GF_RF', 'Contribution')
+      }
+      
+      con <- dbConnect(RSQLite::SQLite(), db)
+      
+      # Check if new IDs need to be generated
+      id_name <- tbl(con, 'id_name') %>% 
+        collect()
+      
+      id_append = variables[!variables %in% id_name$name]
+      if(length(id_append) > 0) {
+        id_append = tibble(id_name = (1L:length(id_append)) + max(id_name$id_name),
+                           name = id_append)
+        DBI::dbAppendTable(con, 'id_name', id_append)
+        id_name <- tbl(con, 'id_name') %>% 
+          collect()
+      }
+      
+      # Upload new data
+      data_append <- pp$data %>% 
+        select(datetime, all_of(variables)) %>% 
+        pivot_longer(-datetime) %>% 
+        left_join(id_name) %>% 
+        mutate(datetime = as.integer(datetime)) %>% 
+        select(-name)
+      
+      df <- tbl(con, 'data') %>% 
+        collect()
+      
+      data_append <- anti_join(data_append, df) %>% 
+        filter(!is.nan(value))
+      
+      if(nrow(data_append) > 0) {
+        DBI::dbAppendTable(con, 'data', data_append)
+      }
+      
+      DBI::dbDisconnect(con)
+      message('Database updated')
     }
   )
 )
@@ -433,57 +485,59 @@ Contribution <- setRefClass(
   'Contribution',
   fields = list(
     cdata = "ANY",
-    xy = "ANY",
+    xy = "numeric",
     shapefile = "ANY",
     epsg = "ANY",
     kljun_params = "ANY",
-    fp_ts = "ANY"
+    footprints = "ANY"
   ),
   methods = list(
     initialize = function(data,
-                          latitude,
-                          shapefile,
+                          xy,
                           epsg = 28992,
+                          shapefile,
                           kljun_params = list(
                             domain = c(-120, 120,-120, 120),
                             nx = 240,
                             ny = 240
-                          ),
-                          xy)
+                          ))
     {
       # Footprint contribution class initialisation
       # Inputs
       #   data <df>: dataframe/tibble from the postprocesing class
-      #   latitude <numeric>: decimal latitude of the EC tower
-      #   xy <vec>: x and y projected coordinates
+      #   xy <numeric>: projected coordinates of the EC tower
+      #   epsg <int/character>: EPSG code for xy and for use with the shapefile
+      #                         and rasters
       #   shapefile <character>: path to the shapefile to calculate the percent
-      #   contribution
-      #   epsg <int/character>: valid EPSG code to use with the shapefile and raster
+      #                          contribution within an AOI
       #   kljun_params <list>: Kljun footprint parameters
       
-      # TODO: simplify the input of lat/xy/shapefile 
-      
       # Select variables that are needed for footprint
-      contribution_variables = c('datetime', 'USTAR', 'DISPLACEMENT_HEIGHT', 'WS',
-                                 'WD', 'MO_LENGTH', 'V_SIGMA')
+      contribution_variables = c('datetime', 'USTAR', 'DISPLACEMENT_HEIGHT',
+                                 'WS', 'WD', 'MO_LENGTH', 'V_SIGMA')
       cdata <<- data %>% 
         select(all_of(contribution_variables))
     
+      # Assign variables to class
       epsg <<- epsg
       xy <<- xy
-      
-      #Calculate parameters that are needed for contribution calculations
-      latitude = latitude * (pi / 180)        # Degrees -> radians
-      angular_velocity = 7.2921159 * 10^-5    #rad/s
-      coriolis_parameter = 2 * angular_velocity * sin(latitude)
-      c_n = 0.3  # coefficient for calculating planetary boundary layer height
-      cdata$PBLH <<- c_n * cdata$USTAR / coriolis_parameter     #planetary boundary layer height
-      
-      #Load a shapefile to calculate how much of footprint is within an AOI
-      shapefile <<- sf::read_sf(shapefile) %>% 
-        sf::st_transform(epsg)
+      xy_sf <- st_point(xy) %>% 
+        st_sfc(crs=epsg)
+      lonlat <- st_transform(xy_sf, crs=4326) %>% 
+        st_coordinates()
+      shapefile <<- read_sf(shapefile) %>% 
+        st_transform(epsg)
       
       kljun_params <<- kljun_params
+      
+      #Calculate parameters that are needed for contribution calculations
+      latitude = lonlat[2] * (pi / 180)        # Degrees -> radians
+      angular_velocity = 7.2921159 * 10^-5     # rad/s
+      coriolis_parameter = 2 * angular_velocity * sin(latitude)
+      # coefficient for calculating planetary boundary layer height
+      c_n = 0.3  
+      # planetary boundary layer height
+      cdata$PBLH <<- c_n * cdata$USTAR / coriolis_parameter 
     },
     run_kljun = function(row, verbosity=FALSE)
     {
@@ -538,67 +592,59 @@ Contribution <- setRefClass(
       })
       return(r)
     },
+    calculate_footprints = function(parallel = NULL)
+    {
+      # Get a timeseries of EC footprints
+      # Inputs:
+      #   parallel <int>: number of cores to use. NULL to not use parallel
+      #                   processing
+      # Returns:
+      #   <raster brick>
+      message('Calculating footprints')
+      tic()
+      if(is.null(parallel)) {
+        
+        footprints <<- apply(cdata %>% select(-datetime),
+                        MARGIN = 1,
+                        simplify = FALSE,
+                        make_raster)
+      } else {
+        registerDoParallel()
+        cl = makeCluster(parallel)
+        footprints <<- foreach(row=iterators::iter(cdata, by='row')) %dopar% {
+          make_raster(row)
+        }
+        stopCluster(cl) 
+      }
+      toc()
+      footprints <<- brick(footprints)
+      names(footprints) <<- format_ISO8601(cdata$datetime)
+    },
     calculate_contribution = function(parallel = FALSE)
     {
       # Calculate the percent contribution of flux coming from a defined area.
       # The shapefile, EPSG code, and Kljun model parameters are specified
       # during class creation
       # Inputs
-      #   parallel <bool>: whether to parallel processing or not
+      #   parallel <int>: number of cores to use. NULL to not use parallel
+      #                   processing
       # Returns
       #   adds a vector of percent contribution to cdata
-      if(parallel == FALSE) {
-        tic()
-        contribution <- apply(cdata %>% select(-datetime), 1, function(row) {
-          r <- make_raster(row)
-          r_sum = cellStats(r, sum)
-          ext_sum = exactextractr::exact_extract(r, shapefile, fun='sum')
-          cont = ext_sum/r_sum
-          return(cont)
-        })
-        toc()
-      } else if(parallel) {
-        registerDoParallel()
-        cl = makeCluster(4)
-        tic()
-        contribution <- foreach(row=iterators::iter(cdata, by='row'),
-                                 .combine = c) %dopar% {
-          r <- make_raster(row)
-          r_sum = cellStats(r, sum)
-          ext_sum = exactextractr::exact_extract(r, shapefile, fun='sum')
-          cont = ext_sum/r_sum
-        }
-        toc()
-        stopCluster(cl) 
-      }
+      
+      calculate_footprints(parallel)
+      
+      message('Calculating contribution percentage')
+      tic()
+      r_sum <- cellStats(footprints, 'sum')
+      suppressWarnings({
+        ee_sum <- exactextractr::exact_extract(footprints,
+                                               shapefile,
+                                               fun='sum')
+      })
+      contribution <- unname( t(ee_sum)[,1] / r_sum)
+      toc()
+      
       cdata$Contribution <<- contribution
-    },
-    calculate_footprint_timeseries = function(parallel = FALSE)
-    {
-      # Get a timeseries of EC footprints
-      # Inputs:
-      #   parallel <bool>: whether to parallel processing or not
-      # Returns:
-      #   <raster brick>
-      if(parallel==FALSE) {
-        tic()
-        fp_ts <<- apply(cdata %>% select(-datetime),
-                         MARGIN = 1,
-                         simplify = FALSE,
-                         make_raster)
-        toc()
-      } else if(parallel) {
-        registerDoParallel()
-        cl = makeCluster(4)
-        tic()
-        fp_ts <<- foreach(row=iterators::iter(cdata, by='row')) %dopar% {
-          make_raster(row)
-        }
-        toc()
-        stopCluster(cl) 
-      }
-      fp_ts <<- brick(fp_ts)
-      names(fp_ts) <<- format_ISO8601(cdata$datetime)
     }
   )
 )

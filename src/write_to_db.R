@@ -95,15 +95,28 @@ db_data = lapply(months, get_meteo) %>%
   bind_rows() %>% 
   distinct()
 
-# Join tables together
-df = full_join(fluxnet, db_data)
+# Join tables together and pivot to long format
+df = full_join(fluxnet, db_data) %>% 
+  pivot_longer(-datetime)
+
+id_name = df %>% 
+  select(name) %>% 
+  distinct() %>% 
+  mutate(id_name = 1L:n()) %>% 
+  select(id_name, name)
+
+df = left_join(df, id_name) %>%
+  select(datetime, id_name, value) %>% 
+  mutate(datetime = as.integer(datetime))
 
 if(!db_exists) {
   # Create the table
+  DBI::dbCreateTable(con, 'id_name', id_name)
   DBI::dbCreateTable(con, 'data', df)
 }
 
 # Write/append data to DB
+DBI::dbAppendTable(con, 'id_name', id_name)
 DBI::dbAppendTable(con, 'data', df)
 
 # Close connection
