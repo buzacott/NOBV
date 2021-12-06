@@ -181,7 +181,7 @@ rasterVis::gplot(cb$footprints[[1]]) +
 Updates the database with some of the variables calculated e.g., NEE, GPP, 
 gap-filled series, contribution.
 
-```{r}
+```{r, eval=FALSE}
 pp$data <- pp$data %>% 
   mutate(Contribution = cb$cdata$Contribution)
 
