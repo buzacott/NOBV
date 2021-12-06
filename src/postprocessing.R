@@ -392,7 +392,7 @@ Postprocessing <- setRefClass(
         select(datetime, FCH4, all_of(training_variables)) %>%
         drop_na()
       
-      # Training/validation data, take 80/20 split
+      # Training/validation data, take 70/30 split
       training_data = rf_data %>% 
         slice_sample(prop = 0.7)
       test_data = rf_data %>% 
