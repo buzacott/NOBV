@@ -1,0 +1,422 @@
+---
+title: "Contribution Zegveld"
+author: "Alexander Buzacott"
+date: "25/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+library(dplyr)
+library(dbplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(DBI)
+library(raster, exclude = 'select')
+library(lubridate)
+library(randomForest)
+library(tictoc)
+library(mgcv)
+
+theme_set(theme_bw())
+
+source('src/postprocessing.R')
+
+db_path <- 'data/Zegveld.db'
+
+con <- dbConnect(RSQLite::SQLite(), db_path)
+id_name <- tbl(con, 'id_name')
+
+wlg_spg_vars = id_name %>% 
+  collect() %>% 
+  filter(str_detect(name, 'SPG_STMP|SPG_SWCT') | name %in% paste0('WLG_WLEV_', c(1:6, 8)))
+
+DBI::dbDisconnect(con)
+
+variables <- c(
+        'FC','SC_SINGLE', 'FCH4', 'USTAR', 'DISPLACEMENT_HEIGHT',
+        'MT1_ATMP_1_H_200_Avg', 'WS', 'WD', 'MO_LENGTH', 'V_SIGMA',
+        'MT1_SWIN_1_H_180','FC_SSITC_TEST', 'FCH4_SSITC_TEST',
+        'MT1_PAR_1_H_180', 'MT1_WIND_1_H_200_Avg', 'MT1_WINS_1_H_200_Avg',
+        'MT1_NETL_1_H_180', 'MT1_NETS_1_H_180',
+        'GPP', 'Respiration', 'FC_GF_NLR', 'FC_GF_NN',
+        'FCH4_GF_RF', 'Contribution', wlg_spg_vars$name)
+
+get_density <- function(x, y, ...) {
+  dens <- MASS::kde2d(x, y, ...)
+  ix <- findInterval(x, dens$x)
+  iy <- findInterval(y, dens$y)
+  ii <- cbind(ix, iy)
+  return(dens$z[ii])
+}
+```
+
+# Load data
+
+```{r}
+# Set the start and end date to postprocess
+start_dt <- as_datetime('2020-05-17T00:00:00', tz='UTC')
+end_dt   <- as_datetime('2021-11-01T00:00:00', tz='UTC')
+
+db_path <- 'data/Zegveld.db'
+
+# Create the class and load the data
+pp = Postprocessing()
+pp$load_data(start_dt, end_dt, db=db_path, variable_list = variables)
+pp$load_pp_data(start_dt, end_dt, db=db_path)
+
+glimpse(pp$data)
+```
+
+### Clean the data
+
+```{r}
+pp$filter_co2()
+pp$filter_ch4()
+pp$flux_partitioning()
+```
+
+### Check wind direction
+
+Comparison between anemometer and met station
+
+```{r}
+ggplot(pp$data, aes(WD, WD_met)) +
+  geom_point()
+```
+
+### Relationship between contribution and wind direction
+
+```{r}
+ggplot(pp$data, aes(WD, Contribution)) +
+  geom_point()
+```
+
+```{r}
+pp$data %>% 
+  mutate(year = year(datetime)) %>% 
+  ggplot(aes(WD_met, Contribution)) +
+  geom_point() +
+  facet_wrap(~year)
+```
+
+### Remove NW-NE wind direction due to cows
+
+But before hand look at wind direction relationships
+
+```{r}
+pp$data %>% 
+  mutate(WDbin = cut(WD, breaks=seq(0, 360, 15))) %>% 
+  ggplot(aes(WDbin, FC)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle=90))
+```
+
+```{r}
+pp$data %>% 
+  mutate(WDbin = cut(WD, breaks=seq(0, 360, 15))) %>% 
+  ggplot(aes(WDbin, FCH4)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle=90))
+```
+
+```{r}
+pp$data = pp$data %>% 
+  filter(WD < 290, WD > 25)
+```
+
+## Contribution
+
+```{r}
+pp$data %>% 
+  select(Contribution, FC) %>% 
+  drop_na() %>% 
+  mutate(k = get_density(Contribution, FC, n=100)) %>% 
+  ggplot(aes(Contribution, FC, col=k)) +
+  geom_point() +
+  viridis::scale_colour_viridis()
+```
+
+```{r}
+pp$data %>% 
+  select(Contribution, FCH4) %>% 
+  drop_na() %>% 
+  mutate(k = get_density(Contribution, FCH4, n=100)) %>% 
+  ggplot(aes(Contribution, FCH4, col=k)) +
+  geom_point() +
+  viridis::scale_colour_viridis()
+```
+
+```{r}
+lm(FC~Contribution, data=pp$data) %>% 
+  summary()
+```
+
+```{r}
+lm(FCH4~Contribution, data=pp$data) %>% 
+  summary()
+```
+
+```{r, fig.width=8, fig.height=8}
+pp$data %>% 
+  select(Contribution, FC, FCH4) %>% 
+  pivot_longer(-Contribution) %>% 
+  drop_na() %>% 
+  group_by(name) %>% 
+  mutate(k = get_density(Contribution, value, n=100)) %>% 
+  ungroup() %>% 
+  ggplot(aes(Contribution, value, col=k)) +
+  geom_point() +
+  viridis::scale_color_viridis() +
+  geom_smooth(method = 'lm', formula = y~x) +
+  ggpmisc::stat_poly_eq(formula = y~x,
+                        aes(label=paste(..eq.label.., ..rr.label.., sep='*","~')), col='blue') +
+  scale_y_continuous(expand=c(0.2,0)) +
+  facet_wrap(~name,
+             scales = 'free_y', ncol=1)
+  
+```
+
+```{r, warning=FALSE}
+pp$data %>% 
+  select(month, Contribution, FC) %>% 
+  pivot_longer(-c(Contribution, month)) %>% 
+  ggplot(aes(Contribution, value)) +
+  geom_point() +
+  geom_smooth(method='lm') +
+  ggpmisc::stat_poly_eq(formula = y~x,
+                        aes(label=paste(..eq.label.., sep='*","~')), col='blue') +
+  scale_y_continuous(expand=c(0.3,0)) +
+  labs(y='FC') +
+  facet_wrap(~month, scales='free_y')
+```
+
+```{r}
+pp$data %>% 
+  select(month, Contribution, FCH4) %>% 
+  pivot_longer(-c(Contribution, month)) %>% 
+  ggplot(aes(Contribution, value)) +
+  geom_point() +
+  geom_smooth(method='lm') +
+  ggpmisc::stat_poly_eq(formula = y~x,
+                        aes(label=paste(..eq.label.., sep='*","~')), col='blue') +
+  scale_y_continuous(expand=c(0.3,0)) +
+  labs(y='FCH4') +
+  facet_wrap(~month, scales='free_y') 
+```
+
+### Bin the contribution data
+
+```{r}
+pp$data = pp$data %>% 
+  mutate(bin = cut(Contribution, breaks=seq(0, 1, 0.1))) 
+  
+pp$data %>% 
+  select(bin, FC, FCH4, GPP) %>% 
+  pivot_longer(-bin) %>% 
+  drop_na() %>% 
+  ggplot(aes(bin, value)) +
+  geom_boxplot() +
+  facet_wrap(~name, scales='free_y', ncol=1)
+```
+
+### LM by bin
+
+```{r, fig.width=15, fig.height=5}
+pp$data %>% 
+  select(bin, Contribution, FC, FCH4, GPP) %>% 
+  pivot_longer(-c(bin, Contribution)) %>% 
+  drop_na() %>% 
+  group_by(bin, name) %>% 
+  mutate(k = get_density(Contribution, value)) %>% 
+  ungroup() %>% 
+  ggplot(aes(Contribution, value, col=k)) +
+  geom_point() +
+  geom_smooth(method='lm') +
+  viridis::scale_colour_viridis() +
+  ggpmisc::stat_poly_eq(aes(label=paste(after_stat(eq.label)))) +
+  ggpmisc::stat_poly_eq(aes(label=paste(after_stat(rr.label))), label.y='bottom') +
+  scale_y_continuous(expand=c(0.3,0)) +
+  facet_grid(rows=vars(name), cols=vars(bin), scales='free')
+```
+
+# Try and account for variation
+
+## FC
+
+### MLR
+
+```{r}
+mlr = lm(FC ~ Contribution + ATMP + SWIN + STMP, data=pp$data)
+summary(mlr)
+
+ggplot() +
+  geom_point(aes(mlr$model$FC, mlr$fitted.values)) +
+  geom_abline(col='red') +
+  labs(x='Obs', y='Fit', title='FC MLR') 
+```
+
+### GAM
+
+```{r}
+gam = gam(FC ~ s(Contribution, k=-1) + ATMP + s(SWIN, k=-1) + STMP,
+          data=pp$data)
+summary(gam)
+
+ggplot() +
+  geom_point(aes(gam$model$FC, gam$fitted.values)) +
+  geom_abline(col='red') +
+  labs(x='Obs', y='Fit', title='FC GAM') 
+```
+
+## FCH4
+
+### MLR
+
+```{r}
+mlr = lm(FCH4 ~ Contribution*ATMP*SWIN*STMP*FC,
+         data=pp$data %>% drop_na()) # %>% select(FCH4, Contribution, ATMP, SWIN, STMP, FC) 
+mlr = step(mlr, trace=0)
+
+summary(mlr)
+
+ggplot() +
+  geom_point(aes(mlr$model$FCH4, mlr$fitted.values)) +
+  geom_abline(col='red') +
+  labs(x='Obs', y='Fit', title='FCH4 MLR') 
+```
+
+### GAM
+
+```{r}
+gam = gam(FCH4 ~ s(Contribution, k=-1) + ATMP + s(SWIN, k=-1) + STMP + FC,
+          data=pp$data)
+
+summary(gam)
+
+ggplot() +
+  geom_point(aes(gam$model$FCH4, gam$fitted.values)) +
+  geom_abline(col='red') +
+  labs(x='Obs', y='Fit', title='FCH4 GAM') 
+```
+
+# PCA
+
+```{r}
+pca_data = pp$data %>% 
+  select(FC, FCH4, ATMP, SWIN, Contribution, STMP) %>% 
+  drop_na()
+
+pca = prcomp(pca_data, scale=TRUE)
+
+summary(pca)
+```
+
+```{r}
+factoextra::fviz_pca_biplot(pca, geom='point')
+```
+
+
+```{r}
+factoextra::fviz_screeplot(pca)
+```
+
+## Add soil water content of the top layer
+
+```{r}
+pca_data2 = pp$data %>% 
+  select(FC, FCH4, ATMP, SWIN, Contribution, STMP,
+         SPG_SWCT_1_D_005_Avg, SPG_SWCT_1_D_015_Avg, SPG_SWCT_1_D_025_Avg) %>% 
+  drop_na()
+
+pca2 = prcomp(pca_data2, scale=TRUE)
+
+factoextra::fviz_pca_biplot(pca2, geom='point')
+```
+
+<!-- ## Consider fetch with making relationship -->
+
+<!-- Fetch rule of thumb: -->
+
+<!-- - H_1_ height of constant flux flayer -->
+<!-- - h: roughness sub layer -->
+
+<!-- Height of EC instruments should be at H1, which should be 2h (above canopy) -->
+
+<!-- fetch = 100 * H_1 -->
+
+
+<!-- ## CNF model -->
+
+<!-- Cumulative Normalised contribution to Flux measurement (%) -->
+
+<!-- $$ -->
+<!-- CNF(x_L) = \int_0^{x_L} \frac{U(z-d)}{u_*kx^2} e^{- \frac{U(z-d)}{u_*kx} }dx = e^{-\frac{U(z-d)}{u_*kx_L}} -->
+<!-- $$ -->
+<!-- where: -->
+
+<!-- - $x_L$ is the distance from the station (m) -->
+<!-- - $U$ is the mean integrated wind speed (m/s) -->
+<!-- - $z$ is the measurement height (m) -->
+<!-- - $d$ is the displacement height (m) (0.67 * canopy height) -->
+<!-- - $u_*$ is the friction velocity (m/s) -->
+<!-- - $k$ is von Karman constant (0.4) -->
+
+<!-- ```{r} -->
+<!-- U = 1.804150 -->
+<!-- USTAR = 0.3340110 -->
+<!-- d = 1.675 -->
+<!-- k = 0.4 -->
+<!-- z = 3 -->
+
+<!-- xL = 0:500 -->
+
+<!-- # Cumulative form -->
+<!-- cnf = exp(-(U*(z-d) / (USTAR*k*xL))) -->
+
+<!-- p1 = ggplot() + -->
+<!--   geom_line(aes(xL, cnf))  -->
+<!-- p2 = ggplot() + -->
+<!--   geom_line(aes(xL[-1], diff(cnf))) -->
+
+<!-- egg::ggarrange(p1,p2) -->
+<!-- ``` -->
+
+<!-- Explore further, but also look reach distances in the Kljun model (Xpeak) -->
+
+<!-- # Relationships with variables -->
+
+<!-- ```{r, fig.width=10, fig.height=8} -->
+<!-- pp$data %>% -->
+<!--   select(FC, FCH4, NEE, GPP, Respiration, Contribution) %>% -->
+<!--   GGally::ggpairs() -->
+<!-- ``` -->
+
+<!-- ### Water levels -->
+
+<!-- ```{r, fig.width=10, fig.height=8} -->
+<!-- pp$data %>% -->
+<!--   select(FC, FCH4, NEE, GPP, Respiration, paste0('WLG_WLEV_', c(1:6, 8))) %>% -->
+<!--   rename_with(.cols=contains('WLG_WLEV'), ~str_sub(.x, 5)) %>% -->
+<!--   GGally::ggpairs() -->
+<!-- ``` -->
+
+<!-- ### Soil temperature -->
+
+<!-- ```{r, fig.width=14, fig.height=12} -->
+<!-- pp$data %>% -->
+<!--   select(FC, FCH4, NEE, GPP, Respiration, contains('SPG_STMP_1')) %>% -->
+<!--   rename_with(.cols=contains('SPG_STMP'), ~paste(str_split_fixed(.x, '_', 6)[,5], 'cm')) %>% -->
+<!--   GGally::ggpairs() -->
+<!-- ``` -->
+
+<!-- ### Soil water content -->
+
+<!-- ```{r, fig.width=14, fig.height=12} -->
+<!-- pp$data %>% -->
+<!--   select(FC, FCH4, NEE, GPP, Respiration, contains('SPG_SWCT_1')) %>% -->
+<!--   rename_with(.cols=contains('SPG_SWCT'), ~paste(str_split_fixed(.x, '_', 6)[,5], 'cm')) %>% -->
+<!--   GGally::ggpairs() -->
+<!-- ``` -->

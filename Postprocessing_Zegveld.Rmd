@@ -1,0 +1,216 @@
+---
+title: "Postprocessing"
+author: "Alexander Buzacott"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(dbplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(DBI)
+library(raster, exclude = 'select')
+library(lubridate)
+library(randomForest)
+library(tictoc)
+
+theme_set(theme_bw())
+
+source('src/postprocessing.R')
+```
+
+# Postprocessing class
+
+This document demonstrates the functions in the `Postprocessing()` class. The 
+class methods can be viewed in `src/postprocessing.R`.
+
+First set the start and end dates to extract from the example database.
+
+```{r}
+# Set the start and end date to postprocess
+start_dt <- as_datetime('2020-05-14T00:00:00', tz='UTC')
+end_dt   <- as_datetime('2021-12-01T00:00:00', tz='UTC')
+
+db_path <- 'data/Zegveld.db'
+
+# Create the class and load the data
+pp = Postprocessing()
+pp$load_data(start_dt, end_dt, db=db_path)
+
+glimpse(pp$data)
+```
+
+
+## Raw data
+
+```{r}
+pp$data %>% 
+  select(datetime, FC, FCH4) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_line() +
+  facet_wrap(~name, ncol=1, scales='free_y')
+```
+
+## Data filtering
+
+At the moment filtering is only done using Eddy Pro quality flags (QC flag == 1)
+and then outlier exclusion using simple quantile methods.
+
+```{r}
+pp$filter_co2(ustar_threshold = 0.10)
+pp$filter_ch4()
+```
+
+## Partition flux
+
+```{r}
+pp$flux_partitioning(plot=TRUE)
+```
+
+TODO: fix data gaps
+
+## Gapfilling
+
+### CO2
+
+Non-linear regression and neural network approaches.
+
+```{r}
+pp$gapfilling_nlr()
+pp$gapfilling_nn()
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, NEE, FC_GF_NLR, FC_GF_NN) %>% 
+  pivot_longer(-datetime) %>% 
+  mutate(year = year(datetime)) %>% 
+  ggplot(aes(datetime, value, col=name)) +
+  geom_line() +
+  facet_wrap(~year, ncol=1, scales='free_x')
+```
+
+### CH4
+
+Random Forest
+
+```{r}
+pp$gapfill_ch4_rf()
+```
+
+Training and testing performance
+
+```{r}
+pp$data %>% 
+  filter(RF_src %in% c('train', 'test')) %>% 
+  ggplot(aes(FCH4, FCH4_RF, col=RF_src)) + 
+  geom_point() +
+  geom_abline() +
+  labs(x = 'Obs', y='Sim', col=NULL)
+```
+
+Summary statistics
+
+```{r}
+pp$data %>% 
+  filter(RF_src %in% c('train', 'test')) %>% 
+  select(RF_src, FCH4, FCH4_RF) %>% 
+  group_by(RF_src) %>% 
+  summarise(n = n(),
+            RMSE = sqrt( mean( (FCH4-FCH4_RF), na.rm=TRUE)^2 ),
+            R2 = cor(FCH4, FCH4_RF, use='pairwise.complete.obs'),
+            LCCC = DescTools::CCC(FCH4, FCH4_RF, na.rm=TRUE)$rho.c$est)
+```
+
+```{r}
+pp$data %>% 
+  mutate(year = year(datetime)) %>% 
+  ggplot() +
+  geom_line(aes(datetime, FCH4_GF_RF, col='FCH4_GF_RF')) +
+  geom_line(aes(datetime, FCH4, col='FCH4')) +
+  labs(y = expression(value~'('*µmol.s^-1*.m^-2*')'), col=NULL) +
+  facet_wrap(~year, ncol=1, scales='free_x')
+```
+
+### Try and improve
+
+```{r}
+# training_variables <- c('ATMP', 'SWIN', 'PAR_met', 'WS_met', #NEE,
+#                               'NETL_met', 'NETS_met', 'STMP', 'month_sin')
+#       
+# rf_data = pp$data %>%
+#   select(datetime, FCH4, all_of(training_variables)) %>%
+#   drop_na()
+#       
+# # Training/validation data, take 70/30 split
+# training_data = rf_data %>% 
+#   slice_sample(prop = 0.7)
+# test_data = rf_data %>% 
+#   filter(!datetime %in% training_data$datetime)
+#       
+# # Fit RandomForest
+# # TODO compare RF params to Irvin et al.
+# rf = randomForest(FCH4 ~ .,
+#                   data=training_data %>% select(-datetime),
+#                   importance = TRUE)
+# 
+# varImpPlot(rf)
+# 
+# # Gap filling
+# predict_data = data %>%
+#   select(datetime, all_of(training_variables)) %>%
+#   drop_na() %>%
+#   mutate(FCH4_RF = predict(rf, newdata=.))
+
+```
+
+# Contribution class
+
+This class uses the [Kljun et al. (2015)](https://doi.org/10.5194/gmd-8-3695-2015) 
+model to calculate the flux footprint. 
+
+Methods are available to calculate the percent contribution within area of
+interest and to return a timeseries raster brick.
+
+```{r}
+cb = Contribution(data = pp$data,
+                  xy = c(117467, 461350),
+                  epsg = 28992,
+                  shapefile = 'data/geodata/zegveld_perceel.gpkg')
+```
+
+
+```{r}
+# The number of cores to use can be specified with parallel
+cb$calculate_contribution(keep_footprints = FALSE, parallel=8)
+```
+
+### Plot of contribution vs flux
+
+```{r, warning=FALSE}
+pp$data %>% 
+  mutate(Contribution = cb$cdata$Contribution) %>% 
+  select(Contribution, FCH4, FC) %>% 
+  pivot_longer(-Contribution) %>% 
+  ggplot(aes(Contribution, value)) +
+  geom_point() +
+  facet_wrap(~name, scales='free_y')
+```
+
+# Upload to database
+
+Updates the database with some of the variables calculated e.g., NEE, GPP, 
+gap-filled series, contribution.
+
+```{r}
+pp$data <- pp$data %>% 
+  mutate(Contribution = cb$cdata$Contribution)
+
+pp$upload_data(db=db_path, overwrite=TRUE)
+```

@@ -1,0 +1,89 @@
+---
+title: "WindDir"
+author: "Alexander Buzacott"
+date: "30/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+library(dplyr)
+library(dbplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(DBI)
+library(lubridate)
+library(knitr)
+
+theme_set(theme_bw())
+
+source('src/postprocessing.R')
+```
+
+# Compare wind directions
+
+## Load data
+
+```{r}
+db_path <- 'data/Zegveld.db'
+
+con <- dbConnect(RSQLite::SQLite(), db_path)
+id_name <- tbl(con, 'id_name')
+data <- tbl(con, 'data') %>% 
+  left_join(id_name) %>% 
+  filter(name %in% c('WD', 'MT1_WIND_1_H_200_Avg')) %>% 
+  select(-id_name) %>% 
+  collect() %>% 
+  mutate(datetime = as_datetime(datetime)) %>% 
+  pivot_wider() %>% 
+  rename(WD_met = MT1_WIND_1_H_200_Avg)
+
+DBI::dbDisconnect(con)
+```
+
+Add extra columns
+
+```{r}
+data <- data %>% 
+  drop_na() %>% 
+  mutate(year = year(datetime),
+         month = month(datetime),
+         diff = WD_met-WD,
+         diff = if_else(diff < 0, diff+360, diff),
+         diff = if_else(diff > 360, diff-360, diff),
+         yearmon = strftime(datetime, '%Y-%m')) 
+```
+
+## Degree difference by year
+
+```{r}
+data %>% 
+  group_by(year) %>% 
+  summarise(mean = mean(diff),
+            sd = sd(diff)) %>% 
+  kable()
+```
+
+## By year and month
+
+```{r}
+data %>% 
+  group_by(year, month) %>% 
+  summarise(mean = mean(diff),
+            sd = sd(diff),
+            n = n()) %>% 
+  kable()
+```
+
+## Plot by year and month
+
+```{r, fig.height=8, fig.width=8}
+data %>% 
+  ggplot(aes(WD, WD_met)) +
+  geom_point() +
+  geom_abline() +
+  facet_wrap(~year+month)
+```

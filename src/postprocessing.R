@@ -58,6 +58,8 @@ fit_respiration_curve <- function(data) {
     filter(ATMP < 11 & ATMP > 9) %>% 
     summarise(NEE = mean(NEE, na.rm=TRUE)) %>% 
     pull(NEE)
+  # TODO: improve this
+  
   
   if(is.na(r_ref)) r_ref = 2.0
   
@@ -89,7 +91,8 @@ fit_gpp_curve <- function(data) {
     mod <- nls(
       GPP ~ b1 * SWIN / (SWIN + b2),
       data = data,
-      start = list(b1 = -1, b2 = 10)
+      start = list(b1 = -1, b2 = 10),
+      control = list(maxiter=100)
     )
     var = mod$m$getPars()
   }
@@ -106,7 +109,8 @@ Postprocessing <- setRefClass(
   fields = list(
     default_variables = "character",
     db_location = "character",
-    data = "ANY"
+    data = "ANY",
+    ch4_rf = "ANY"
   ),
   methods = list(
     initialize = function()
@@ -131,39 +135,44 @@ Postprocessing <- setRefClass(
         db <- db_location
       }
 
-      con <- dbConnect(RSQLite::SQLite(), db)
-      id_name <- tbl(con, 'id_name')
-      df <- tbl(con, 'data') %>% 
-        left_join(id_name) %>% 
-        filter(name %in% !!variable_list,
-               datetime >= !!as.integer(start_dt),
-               datetime <= !!as.integer(end_dt)) %>% 
-        select(datetime, name, value) %>% 
-        collect() %>% 
-        # Pivot to wide format
-        pivot_wider(id_col=datetime, names_from=name, values_from=value) %>% 
-        # Add NEE, night time and month columns
-        mutate(datetime = as_datetime(datetime, tz='UTC'),
-               NEE = FC + SC_SINGLE,
-               night = MT1_SWIN_1_H_180 < 10,
-               month = month(datetime),
-               FCH4 = FCH4 / 1000) # nmol/s/m2 -> µmol/s/m2
-      
-      # Rename columns
-      df <- df %>% 
-        rename('ATMP' = 'MT1_ATMP_1_H_200_Avg',
-               'SWIN' = 'MT1_SWIN_1_H_180',
-               'FC_flag' = 'FC_SSITC_TEST',
-               'FCH4_flag' = 'FCH4_SSITC_TEST',
-               'PAR_met' = 'MT1_PAR_1_H_180' ,
-               'WD_met' = 'MT1_WIND_1_H_200_Avg',
-               'WS_met' = 'MT1_WINS_1_H_200_Avg',
-               'NETL_met' = 'MT1_NETL_1_H_180',
-               'NETS_met' = 'MT1_NETS_1_H_180',
-               'STMP' = 'SPG_STMP_1_D_005_Avg')
-      
-      # Assign to field
-      data <<- df
+      con <- DBI::dbConnect(RSQLite::SQLite(), db)
+      tryCatch({
+        id_name <- tbl(con, 'id_name')
+        df <- tbl(con, 'data') %>% 
+          left_join(id_name) %>% 
+          filter(name %in% !!variable_list,
+                 datetime >= !!as.integer(start_dt),
+                 datetime <= !!as.integer(end_dt)) %>% 
+          select(datetime, name, value) %>% 
+          collect() %>% 
+          # Pivot to wide format
+          pivot_wider(id_col=datetime, names_from=name, values_from=value) %>% 
+          # Add NEE, night time and month columns
+          mutate(datetime = as_datetime(datetime, tz='UTC'),
+                 NEE = FC + SC_SINGLE,
+                 night = MT1_SWIN_1_H_180 < 10,
+                 month = month(datetime),
+                 FCH4 = FCH4 / 1000) %>% # nmol/s/m2 -> µmol/s/m2
+          arrange(datetime)
+        
+        # Rename columns
+        df <- df %>% 
+          rename('ATMP' = 'MT1_ATMP_1_H_200_Avg',
+                 'SWIN' = 'MT1_SWIN_1_H_180',
+                 'FC_flag' = 'FC_SSITC_TEST',
+                 'FCH4_flag' = 'FCH4_SSITC_TEST',
+                 'PAR_met' = 'MT1_PAR_1_H_180' ,
+                 'WD_met' = 'MT1_WIND_1_H_200_Avg',
+                 'WS_met' = 'MT1_WINS_1_H_200_Avg',
+                 'NETL_met' = 'MT1_NETL_1_H_180',
+                 'NETS_met' = 'MT1_NETS_1_H_180',
+                 'STMP' = 'SPG_STMP_1_D_005_Avg')
+        
+        # Assign to field
+        data <<- df
+      },
+      error = function(e) message(e),
+      finally = DBI::dbDisconnect(con))
     },
     filter_co2 = function(ustar_threshold = 0.10)
     {
@@ -392,7 +401,7 @@ Postprocessing <- setRefClass(
         select(datetime, FCH4, all_of(training_variables)) %>%
         drop_na()
       
-      # Training/validation data, take 80/20 split
+      # Training/validation data, take 70/30 split
       training_data = rf_data %>% 
         slice_sample(prop = 0.7)
       test_data = rf_data %>% 
@@ -403,6 +412,8 @@ Postprocessing <- setRefClass(
       rf = randomForest(FCH4 ~ .,
                         data=training_data %>% select(-datetime),
                         importance = TRUE)
+      
+      ch4_rf <<- rf
       
       if(plot) {
         # Plot variable importance
@@ -433,16 +444,16 @@ Postprocessing <- setRefClass(
           geom_line(aes(datetime, FCH4_GF_RF, col='GF RF')) 
       }
     },
-    upload_data = function(db, variables) {
+    upload_data = function(db, variables, overwrite=FALSE) {
       if(missing(db)) {
-        stop('Missing path to db')
+        db <- db_location
       }
       if(missing(variables)) {
         variables = c('NEE', 'GPP', 'Respiration', 'FC_GF_NLR', 'FC_GF_NN',
                       'FCH4_GF_RF', 'Contribution')
       }
       
-      con <- dbConnect(RSQLite::SQLite(), db)
+      con <- dbConnect(RSQLite::SQLite(), db, append=FALSE)
       
       # Check if new IDs need to be generated
       id_name <- tbl(con, 'id_name') %>% 
@@ -457,26 +468,70 @@ Postprocessing <- setRefClass(
           collect()
       }
       
-      # Upload new data
-      data_append <- pp$data %>% 
-        select(datetime, all_of(variables)) %>% 
-        pivot_longer(-datetime) %>% 
-        left_join(id_name) %>% 
+      # Upload data to postprocessing table
+      pp_data <- data %>% 
+        select(datetime, any_of(variables)) %>%
+        pivot_longer(-datetime) %>%
+        left_join(id_name) %>%
         mutate(datetime = as.integer(datetime)) %>% 
         select(-name)
       
-      df <- tbl(con, 'data') %>% 
-        collect()
+      # Check if table exists
+      table_list = DBI::dbListTables(con)
       
-      data_append <- anti_join(data_append, df) %>% 
-        filter(!is.nan(value))
-      
-      if(nrow(data_append) > 0) {
-        DBI::dbAppendTable(con, 'data', data_append)
+      if(!'postprocessing' %in% table_list) {
+        message('Postprocessing table created in db')
+        DBI::dbCreateTable(con, 'postprocessing', pp_data)
+        DBI::dbAppendTable(con, 'postprocessing', pp_data)
+      } else if(overwrite) {
+        DBI::dbWriteTable(con, 'postprocessing', pp_data, overwrite=TRUE)
+      } else {
+        pp_data_db <- tbl(con, 'postprocessing') %>% 
+          collect()
+        
+        pp_data_append <- anti_join(pp_data, pp_data_db) %>% 
+          filter(!is.nan(value))
+        
+        if(nrow(pp_data_append) > 0) {
+          DBI::dbAppendTable(con, 'postprocessing', pp_data_append)
+        }
       }
       
       DBI::dbDisconnect(con)
-      message('Database updated')
+      message('Postprocessing data uploaded')
+    },
+    load_pp_data = function(db, start_dt, end_dt, variables)
+    {
+      if(missing(db)) {
+        db <- db_location
+      }
+      if(missing(variables)) {
+        variables = c('NEE', 'GPP', 'Respiration', 'FC_GF_NLR', 'FC_GF_NN',
+                      'FCH4_GF_RF', 'Contribution')
+      }
+      
+      con <- DBI::dbConnect(RSQLite::SQLite(), db)
+      tryCatch({
+        id_name <- tbl(con, 'id_name')
+        df <- tbl(con, 'postprocessing') %>% 
+          left_join(id_name) %>% 
+          filter(name %in% !!variables,
+                 datetime >= !!as.integer(start_dt),
+                 datetime <= !!as.integer(end_dt)) %>% 
+          select(datetime, name, value) %>% 
+          collect() %>% 
+          # Pivot to wide format
+          pivot_wider(id_col=datetime, names_from=name, values_from=value) %>% 
+          mutate(datetime = as_datetime(datetime)) %>% 
+          arrange(datetime)
+        
+        # Assign to field
+        data <<- left_join(data, df)
+        message('postprocessing data loaded')
+      },
+      error = function(e) message(e),
+      finally = DBI::dbDisconnect(con))
+      
     }
   )
 )
@@ -620,7 +675,7 @@ Contribution <- setRefClass(
       footprints <<- brick(footprints)
       names(footprints) <<- format_ISO8601(cdata$datetime)
     },
-    calculate_contribution = function(parallel = FALSE)
+    calculate_contribution = function(keep_footprints = TRUE, parallel = FALSE)
     {
       # Calculate the percent contribution of flux coming from a defined area.
       # The shapefile, EPSG code, and Kljun model parameters are specified
@@ -631,19 +686,41 @@ Contribution <- setRefClass(
       # Returns
       #   adds a vector of percent contribution to cdata
       
-      calculate_footprints(parallel)
-      
-      message('Calculating contribution percentage')
       tic()
-      r_sum <- cellStats(footprints, 'sum')
-      suppressWarnings({
-        ee_sum <- exactextractr::exact_extract(footprints,
-                                               shapefile,
-                                               fun='sum')
-      })
-      contribution <- unname( t(ee_sum)[,1] / r_sum)
+      if(keep_footprints) {
+        calculate_footprints(parallel)
+        
+        message('Calculating contribution percentage')
+        r_sum <- cellStats(footprints, 'sum')
+        suppressWarnings({
+          ee_sum <- exactextractr::exact_extract(footprints,
+                                                 shapefile,
+                                                 fun='sum')
+        })
+        contribution <- unname( t(ee_sum)[,1] / r_sum)
+      } else {
+        if(parallel) {
+          registerDoParallel()
+          cl = makeCluster(4)
+          tic()
+          contribution <- foreach(row=iterators::iter(cdata, by='row'),
+                                  .combine = c) %dopar% {
+                                    r <- make_raster(row)
+                                    r_sum = cellStats(r, sum)
+                                    ext_sum = exactextractr::exact_extract(r, shapefile, fun='sum')
+                                    cont = ext_sum/r_sum
+                                  }
+        } else {
+          contribution <- apply(cdata %>% select(-datetime), 1, function(row) {
+            r <- make_raster(row)
+            r_sum = cellStats(r, sum)
+            ext_sum = exactextractr::exact_extract(r, shapefile, fun='sum')
+            cont = ext_sum/r_sum
+            return(cont)
+          })
+        }
+      }
       toc()
-      
       cdata$Contribution <<- contribution
     }
   )

@@ -1,0 +1,130 @@
+---
+title: "Postprocessing"
+author: "Alexander Buzacott"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(dbplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(DBI)
+library(raster, exclude = 'select')
+library(lubridate)
+library(randomForest)
+library(tictoc)
+
+theme_set(theme_bw())
+
+source('src/postprocessing.R')
+```
+
+# Postprocessing class
+
+This document demonstrates the functions in the `Postprocessing()` class. The 
+class methods can be viewed in `src/postprocessing.R`.
+
+First set the start and end dates to extract from the example database.
+
+```{r}
+# Set the start and end date to postprocess
+start_dt <- as_datetime('2021-08-01T00:00:00', tz='UTC')
+end_dt   <- as_datetime('2021-11-21T00:00:00', tz='UTC')
+
+db_path <- 'data/Assendelft.db'
+
+# Create the class and load the data
+pp = Postprocessing()
+pp$load_data(start_dt, end_dt, db=db_path)
+
+glimpse(pp$data)
+```
+
+## Data filtering
+
+At the moment filtering is only done using Eddy Pro quality flags (QC flag == 1)
+and then outlier exclusion using simple quantile methods.
+
+```{r}
+pp$filter_co2()
+pp$filter_ch4()
+```
+
+## Partition flux
+
+```{r}
+pp$flux_partitioning(plot=TRUE)
+```
+
+## Gapfilling
+
+### CO2
+
+Non-linear regression and neural network approaches.
+
+```{r}
+pp$gapfilling_nlr()
+pp$gapfilling_nn()
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, NEE, FC_GF_NLR, FC_GF_NN) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value, col=name)) +
+  geom_line()
+```
+
+### CH4
+
+Random Forest
+
+```{r}
+pp$gapfill_ch4_rf()
+```
+
+Training and testing performance
+
+```{r}
+pp$data %>% 
+  filter(RF_src %in% c('train', 'test')) %>% 
+  ggplot(aes(FCH4, FCH4_RF, col=RF_src)) + 
+  geom_point() +
+  geom_abline() +
+  labs(x = 'Obs', y='Sim', col=NULL)
+```
+
+Summary statistics
+
+```{r}
+pp$data %>% 
+  filter(RF_src %in% c('train', 'test')) %>% 
+  select(RF_src, FCH4, FCH4_RF) %>% 
+  group_by(RF_src) %>% 
+  summarise(n = n(),
+            RMSE = sqrt( mean( (FCH4-FCH4_RF), na.rm=TRUE)^2 ),
+            R2 = cor(FCH4, FCH4_RF, use='pairwise.complete.obs'),
+            LCCC = DescTools::CCC(FCH4, FCH4_RF, na.rm=TRUE)$rho.c$est)
+```
+
+```{r}
+ggplot(pp$data) +
+  geom_line(aes(datetime, FCH4_GF_RF, col='FCH4_GF_RF')) +
+  geom_line(aes(datetime, FCH4, col='FCH4')) +
+  labs(y = expression(value~'('*µmol.s^-1*.m^-2*')'), col=NULL)
+```
+
+# Upload to database
+
+Updates the database with some of the variables calculated e.g., NEE, GPP, 
+gap-filled series, contribution.
+
+```{r}
+pp$upload_data(db=db_path)
+```
+
