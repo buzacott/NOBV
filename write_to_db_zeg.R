@@ -15,7 +15,7 @@ get_fluxnet <- function(x) {
       mutate(datetime = as_datetime(as.character(datetime),
                                     format = '%Y%m%d%H%M',
                                     tz = 'UTC')) %>% 
-      filter(datetime >= start_dt, datetime < end_dt)
+      filter(datetime >= start_dt, datetime <= end_dt)
   } else {
     df = tibble()
   }
@@ -39,7 +39,7 @@ get_meteo <- function(x) {
   # Filter dates
   df <- df %>% 
     rename(datetime = dt) %>% 
-    filter(datetime >= start_dt, datetime < end_dt)
+    filter(datetime >= start_dt, datetime <= end_dt)
   
   return(df)
 }
@@ -48,11 +48,12 @@ default_fluxnet_variables <-
   c('H', 'LE', 'ET', 'FC', 'FCH4', 'SC_SINGLE', 'WS', 'WS_MAX', 'WD', 'WD_SIGMA', 'USTAR', 'MO_LENGTH',
     'T_SONIC', 'TA_EP', 'PA_EP', 'RH_EP', 'VPD_EP', 'TDEW', 'U_SIGMA', 'V_SIGMA', 'W_SIGMA',
     'FC_SSITC_TEST', 'FCH4_SSITC_TEST', 'BADM_LOCATION_LAT', 'BADM_LOCATION_LONG','BADM_INST_HEIGHT_SA', 
-    'BADM_HEIGHTC', 'DISPLACEMENT_HEIGHT', 'ROUGHNESS_LENGTH', 'CUSTOM_RSSI_77_MEAN', 'CUSTOM_CO2_SIGNAL_STRENGTH_7500_MEAN')
+    'BADM_HEIGHTC', 'DISPLACEMENT_HEIGHT', 'ROUGHNESS_LENGTH', 'CUSTOM_RSSI_77_MEAN', 'CUSTOM_CO2_SIGNAL_STRENGTH_7500_MEAN',
+    'ALBEDO_1_1_1', 'LW_IN_1_1_1', 'LW_OUT_1_1_1', 'PTEMP_1_1_1', 'RH_1_1_1', 'RH_1_2_1', 'RH_1_3_1', 'SW_IN_1_1_1', 'SW_OUT_1_1_1', 'TA_1_1_1', 'TA_1_2_1', 'TA_1_3_1', 'TS_1_1_1', 'TS_1_2_1', 'VIN_1_1_1', 'WL_1_1_1', 'TW_1_1_1')
 #------------------------------------------------------------------------------#
 
 # Dates to extract and write to DB
-start_dt <- as_datetime('2020-05-01T00:00:00')
+start_dt <- as_datetime('2020-05-01T00:00:01')
 end_dt   <- as_datetime('2021-12-01T00:00:00')
 
 # Path to eddy pro output (fluxnet files)
@@ -83,7 +84,7 @@ if(db_exists) {
 }
 
 # Function expects data to be arranged yyyy/mm underneath the provided path
-if(strftime(end_dt, '%d%H%M%S') == '01000000') {
+if(strftime(end_dt, '%d%H%M') == '010000') {
   interval = interval(floor_date(start_dt, 'month')+1, end_dt-1) 
 } else {
   interval = interval(floor_date(start_dt, 'month')+1, end_dt) 
@@ -100,8 +101,11 @@ db_data = lapply(months, get_meteo) %>%
   bind_rows() %>% 
   distinct()
 
-# Join tables together and pivot to long format
-df = full_join(fluxnet, db_data) %>% 
+df = tibble(datetime = seq(min(c(fluxnet$datetime, db_data$datetime)),
+                           max(c(fluxnet$datetime, db_data$datetime)),
+                           1800)) %>% 
+  left_join(fluxnet) %>% 
+  left_join(db_data) %>% 
   pivot_longer(-datetime)
 
 id_name = df %>% 

@@ -124,12 +124,12 @@ Postprocessing <- setRefClass(
       
       db_location <<- file.path('data', 'sample.db')
     },
-    load_data = function(start_dt, end_dt, db = NULL, variable_list = NULL)
+    load_data = function(start_dt, end_dt, db = NULL, variables = NULL)
     {
       # Check to see if there is a given list of variables, otherwise use default
       # variables
-      if(is.null(variable_list)) {
-        variable_list <- default_variables
+      if(is.null(variables)) {
+        variables <- default_variables
       }
       if(is.null(db)) {
         db <- db_location
@@ -140,7 +140,7 @@ Postprocessing <- setRefClass(
         id_name <- tbl(con, 'id_name')
         df <- tbl(con, 'data') %>% 
           left_join(id_name) %>% 
-          filter(name %in% !!variable_list,
+          filter(name %in% !!variables,
                  datetime >= !!as.integer(start_dt),
                  datetime <= !!as.integer(end_dt)) %>% 
           select(datetime, name, value) %>% 
@@ -197,8 +197,8 @@ Postprocessing <- setRefClass(
       # Filter outliers
       # Note: To be replace with robust outlier detection
       data <<- data %>% 
-        mutate(across(all_of(variables), ~if_else(FC > quantile(FC, 0.97, na.rm=TRUE), NaN, .x)),
-               across(all_of(variables), ~if_else(FC < quantile(FC, 0.01, na.rm=TRUE), NaN, .x)))
+        mutate(across(all_of(variables), ~if_else(FC > quantile(FC, 0.975, na.rm=TRUE), NaN, .x)),
+               across(all_of(variables), ~if_else(FC < quantile(FC, 0.025, na.rm=TRUE), NaN, .x)))
     },
     filter_ch4 = function()
     {
@@ -211,8 +211,8 @@ Postprocessing <- setRefClass(
       # Outlier detection
       # Note replace with robust detection algorithm
       data <<- data %>% 
-        mutate(FCH4 = if_else(FCH4 > quantile(FCH4, 0.99, na.rm=TRUE), NaN, FCH4),
-               FCH4 = if_else(FCH4 < quantile(FCH4, 0.01, na.rm=TRUE), NaN, FCH4))
+        mutate(FCH4 = if_else(FCH4 > quantile(FCH4, 0.975, na.rm=TRUE), NaN, FCH4),
+               FCH4 = if_else(FCH4 < quantile(FCH4, 0.025, na.rm=TRUE), NaN, FCH4))
     },
     flux_partitioning = function(plot = FALSE) 
     {
@@ -551,6 +551,7 @@ Contribution <- setRefClass(
                           xy,
                           epsg = 28992,
                           shapefile,
+                          tower_height = 3,
                           kljun_params = list(
                             domain = c(-120, 120,-120, 120),
                             nx = 240,
@@ -565,6 +566,7 @@ Contribution <- setRefClass(
       #                         and rasters
       #   shapefile <character>: path to the shapefile to calculate the percent
       #                          contribution within an AOI
+      #   shapefile <character>: height of the EC tower/anemometer
       #   kljun_params <list>: Kljun footprint parameters
       
       # Select variables that are needed for footprint
@@ -576,6 +578,7 @@ Contribution <- setRefClass(
       # Assign variables to class
       epsg <<- epsg
       xy <<- xy
+      tower_height <<- tower_height
       xy_sf <- st_point(xy) %>% 
         st_sfc(crs=epsg)
       lonlat <- st_transform(xy_sf, crs=4326) %>% 
@@ -606,7 +609,7 @@ Contribution <- setRefClass(
       # TODO: the verbosity flag won't work on windows
       if(!verbosity) sink('/dev/null')
       ffp_clim = calc_footprint_FFP_climatology(
-        zm = (3 - row[['DISPLACEMENT_HEIGHT']]),
+        zm = (tower_height - row[['DISPLACEMENT_HEIGHT']]),
         z0 = NaN,
         rs = NaN,
         umean = row[['WS']],
@@ -638,7 +641,7 @@ Contribution <- setRefClass(
       }
       suppressWarnings({
         # Raster expects left to right, top to bottom
-        r <- raster(m[nrow(m):1,],
+        r <- raster(t(m[,ncol(m):1]),
                     xmn = xy[1] + kljun_params$domain[1] + 0.5,
                     xmx = xy[1] + kljun_params$domain[2] + 0.5,
                     ymn = xy[2] + kljun_params$domain[3] + 0.5,
@@ -660,9 +663,9 @@ Contribution <- setRefClass(
       if(is.null(parallel)) {
         
         footprints <<- apply(cdata %>% select(-datetime),
-                        MARGIN = 1,
-                        simplify = FALSE,
-                        make_raster)
+                             MARGIN = 1,
+                             simplify = FALSE,
+                             make_raster)
       } else {
         registerDoParallel()
         cl = makeCluster(parallel)

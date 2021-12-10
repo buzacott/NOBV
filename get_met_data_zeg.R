@@ -19,7 +19,7 @@ Sys.setenv(TZ=tz)
 site = 'ZEG'
 
 # Number of months to download
-start_date = as_date('2020-05-01')
+start_date = as_date('2021-11-01')
 end_date   = as_date('2021-11-30')
 
 interval = interval(start_date, end_date)

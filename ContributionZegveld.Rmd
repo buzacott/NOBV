@@ -42,7 +42,7 @@ variables <- c(
         'MT1_PAR_1_H_180', 'MT1_WIND_1_H_200_Avg', 'MT1_WINS_1_H_200_Avg',
         'MT1_NETL_1_H_180', 'MT1_NETS_1_H_180',
         'GPP', 'Respiration', 'FC_GF_NLR', 'FC_GF_NN',
-        'FCH4_GF_RF', 'Contribution', wlg_spg_vars$name)
+        'FCH4_GF_RF', 'Contribution', 'cb_grass', wlg_spg_vars$name)
 
 get_density <- function(x, y, ...) {
   dens <- MASS::kde2d(x, y, ...)
@@ -53,24 +53,24 @@ get_density <- function(x, y, ...) {
 }
 ```
 
-# Load data
+## Load data
 
 ```{r}
 # Set the start and end date to postprocess
 start_dt <- as_datetime('2020-05-17T00:00:00', tz='UTC')
-end_dt   <- as_datetime('2021-11-01T00:00:00', tz='UTC')
+end_dt   <- as_datetime('2021-12-01T00:00:00', tz='UTC')
 
 db_path <- 'data/Zegveld.db'
 
 # Create the class and load the data
 pp = Postprocessing()
-pp$load_data(start_dt, end_dt, db=db_path, variable_list = variables)
-pp$load_pp_data(start_dt, end_dt, db=db_path)
+pp$load_data(start_dt, end_dt, db=db_path, variables = variables)
+pp$load_pp_data(start_dt, end_dt, db=db_path, variables = variables)
 
 glimpse(pp$data)
 ```
 
-### Clean the data
+## Clean the data
 
 ```{r}
 pp$filter_co2()
@@ -78,7 +78,7 @@ pp$filter_ch4()
 pp$flux_partitioning()
 ```
 
-### Check wind direction
+## Check wind direction
 
 Comparison between anemometer and met station
 
@@ -87,24 +87,19 @@ ggplot(pp$data, aes(WD, WD_met)) +
   geom_point()
 ```
 
-### Relationship between contribution and wind direction
+## BEFORE wind filtering
+
+Filter northerly wind directions due to cows, but before hand look at wind
+direction relationships
+
+### WD vs Contribution
 
 ```{r}
 ggplot(pp$data, aes(WD, Contribution)) +
   geom_point()
 ```
 
-```{r}
-pp$data %>% 
-  mutate(year = year(datetime)) %>% 
-  ggplot(aes(WD_met, Contribution)) +
-  geom_point() +
-  facet_wrap(~year)
-```
-
-### Remove NW-NE wind direction due to cows
-
-But before hand look at wind direction relationships
+### WD vs FC
 
 ```{r}
 pp$data %>% 
@@ -113,6 +108,7 @@ pp$data %>%
   geom_boxplot() +
   theme(axis.text.x = element_text(angle=90))
 ```
+### WD vs FCH4
 
 ```{r}
 pp$data %>% 
@@ -122,12 +118,64 @@ pp$data %>%
   theme(axis.text.x = element_text(angle=90))
 ```
 
+### Binned WD vs mean fluxes in bin
+
 ```{r}
-pp$data = pp$data %>% 
-  filter(WD < 290, WD > 25)
+pp_bin_wd = pp$data %>% 
+  mutate(bin = cut(WD, breaks=seq(0, 360, 5))) %>% 
+  group_by(bin) %>% 
+  select(bin, WD, FC, FCH4) %>% 
+  pivot_longer(-c(bin, WD)) %>% 
+  drop_na() %>% 
+  group_by(bin, name) %>% 
+  summarise(bin_n = mean(WD),
+            mean = mean(value),
+            median = median(value),
+            sd = sd(value))
+
+ggplot(pp_bin_wd, aes(bin_n, mean)) +
+  geom_point() +
+  geom_pointrange(aes(bin_n, ymin=mean-sd, ymax=mean+sd)) +
+  geom_smooth(method='lm') +
+  facet_wrap(~name, scales='free_y')
 ```
 
-## Contribution
+```{r}
+knitr::include_graphics('images/zegveld_wd_100.png')
+```
+
+
+```{r}
+pp_bin_wd %>% 
+  group_by(name) %>% 
+  mutate(bin_n = ceiling(bin_n)) %>% 
+  ggplot() +
+  geom_spoke(aes(x=0, y=0, angle=bin_n, radius=mean)) +
+  facet_wrap(~name, scales='free')
+```
+
+```{r, fig.width=10, fig.height=4}
+pp_bin_wd_month = pp$data %>% 
+  mutate(bin = cut(WD, breaks=seq(0, 360, 5)),
+         month = month(datetime)) %>% 
+  select(bin, WD, FC, FCH4, month) %>% 
+  pivot_longer(-c(bin, WD, month)) %>% 
+  drop_na() %>% 
+  group_by(bin, name, month) %>% 
+  summarise(bin_n = mean(WD),
+            mean = mean(value),
+            median = median(value),
+            sd = sd(value))
+
+pp_bin_wd_month %>% 
+  filter(mean < 50) %>% 
+  ggplot(aes(bin_n, mean)) +
+  geom_point() +
+  geom_smooth(method='lm') +
+  facet_grid(cols = vars(month), rows=vars(name), scales='free_y')
+```
+
+### Contribution 
 
 ```{r}
 pp$data %>% 
@@ -136,6 +184,10 @@ pp$data %>%
   mutate(k = get_density(Contribution, FC, n=100)) %>% 
   ggplot(aes(Contribution, FC, col=k)) +
   geom_point() +
+  geom_smooth(method='lm') +
+  ggpmisc::stat_poly_eq(formula = y~x,
+                        aes(label=paste(..eq.label.., ..rr.label.., sep='*","~')), col='blue') +
+  scale_y_continuous(expand=c(0.2,0)) +
   viridis::scale_colour_viridis()
 ```
 
@@ -146,41 +198,91 @@ pp$data %>%
   mutate(k = get_density(Contribution, FCH4, n=100)) %>% 
   ggplot(aes(Contribution, FCH4, col=k)) +
   geom_point() +
+  geom_smooth(method='lm') +
+  ggpmisc::stat_poly_eq(formula = y~x,
+                        aes(label=paste(..eq.label.., ..rr.label.., sep='*","~')), col='blue') +
+  viridis::scale_colour_viridis() +
+  scale_y_continuous(expand=c(0.2,0))
+```
+
+## AFTER filtering
+
+### Filter out the northerly winds
+
+```{r}
+pp_data = pp$data %>% 
+  filter(WD < 300, WD > 35)
+```
+
+### Plots of FC/FCH4 vs Contribution
+
+```{r}
+pp_data %>% 
+  select(Contribution, FC) %>% 
+  drop_na() %>% 
+  mutate(k = get_density(Contribution, FC, n=100)) %>% 
+  ggplot(aes(Contribution, FC, col=k)) +
+  geom_point() +
+  geom_smooth(method='lm') +
+  ggpmisc::stat_poly_eq(formula = y~x,
+                        aes(label=paste(..eq.label.., ..rr.label.., sep='*","~')), col='blue') +
   viridis::scale_colour_viridis()
 ```
 
 ```{r}
-lm(FC~Contribution, data=pp$data) %>% 
+pp_data %>% 
+  select(Contribution, FCH4) %>% 
+  drop_na() %>% 
+  mutate(k = get_density(Contribution, FCH4, n=100)) %>% 
+  ggplot(aes(Contribution, FCH4, col=k)) +
+  geom_point() +
+  geom_smooth(method='lm') +
+  ggpmisc::stat_poly_eq(formula = y~x,
+                        aes(label=paste(..eq.label.., ..rr.label.., sep='*","~')), col='blue') +
+  viridis::scale_colour_viridis()
+```
+### Linear models
+
+```{r}
+lm(FC~Contribution, data=pp_data) %>% 
   summary()
 ```
 
 ```{r}
-lm(FCH4~Contribution, data=pp$data) %>% 
+lm(FCH4~Contribution, data=pp_data) %>% 
   summary()
 ```
 
 ```{r, fig.width=8, fig.height=8}
-pp$data %>% 
-  select(Contribution, FC, FCH4) %>% 
-  pivot_longer(-Contribution) %>% 
+p1 = pp_data %>% 
+  select(Contribution, FC) %>% 
   drop_na() %>% 
-  group_by(name) %>% 
-  mutate(k = get_density(Contribution, value, n=100)) %>% 
-  ungroup() %>% 
-  ggplot(aes(Contribution, value, col=k)) +
+  mutate(k = get_density(Contribution, FC, n=100)) %>% 
+  ggplot(aes(Contribution, FC, col=k)) +
   geom_point() +
   viridis::scale_color_viridis() +
   geom_smooth(method = 'lm', formula = y~x) +
   ggpmisc::stat_poly_eq(formula = y~x,
                         aes(label=paste(..eq.label.., ..rr.label.., sep='*","~')), col='blue') +
-  scale_y_continuous(expand=c(0.2,0)) +
-  facet_wrap(~name,
-             scales = 'free_y', ncol=1)
-  
+  scale_y_continuous(expand=c(0.2,0))
+p2 = pp_data %>% 
+  select(Contribution, FCH4) %>% 
+  drop_na() %>% 
+  mutate(k = get_density(Contribution, FCH4, n=100)) %>% 
+  ggplot(aes(Contribution, FCH4, col=k)) +
+  geom_point() +
+  viridis::scale_color_viridis() +
+  geom_smooth(method = 'lm', formula = y~x) +
+  ggpmisc::stat_poly_eq(formula = y~x,
+                        aes(label=paste(..eq.label.., ..rr.label.., sep='*","~')), col='blue') +
+  scale_y_continuous(expand=c(0.2,0))
+
+egg::ggarrange(p1, p2, ncol=1)
 ```
+### Linear relationships by month
 
 ```{r, warning=FALSE}
-pp$data %>% 
+pp_data %>% 
   select(month, Contribution, FC) %>% 
   pivot_longer(-c(Contribution, month)) %>% 
   ggplot(aes(Contribution, value)) +
@@ -194,7 +296,7 @@ pp$data %>%
 ```
 
 ```{r}
-pp$data %>% 
+pp_data %>% 
   select(month, Contribution, FCH4) %>% 
   pivot_longer(-c(Contribution, month)) %>% 
   ggplot(aes(Contribution, value)) +
@@ -210,10 +312,10 @@ pp$data %>%
 ### Bin the contribution data
 
 ```{r}
-pp$data = pp$data %>% 
+pp_data = pp_data %>% 
   mutate(bin = cut(Contribution, breaks=seq(0, 1, 0.1))) 
   
-pp$data %>% 
+pp_data %>% 
   select(bin, FC, FCH4, GPP) %>% 
   pivot_longer(-bin) %>% 
   drop_na() %>% 
@@ -225,7 +327,7 @@ pp$data %>%
 ### LM by bin
 
 ```{r, fig.width=15, fig.height=5}
-pp$data %>% 
+pp_data %>% 
   select(bin, Contribution, FC, FCH4, GPP) %>% 
   pivot_longer(-c(bin, Contribution)) %>% 
   drop_na() %>% 
@@ -242,6 +344,52 @@ pp$data %>%
   facet_grid(rows=vars(name), cols=vars(bin), scales='free')
 ```
 
+```{r}
+pp_bin_cont = pp_data %>% 
+  mutate(bin = cut(Contribution, breaks=seq(0, 1, 0.01))) %>% 
+  group_by(bin) %>% 
+  select(bin, Contribution, FC, FCH4, WS, WD) %>% 
+  pivot_longer(-c(bin, Contribution, WS, WD)) %>% 
+  drop_na() %>% 
+  group_by(bin, name) %>% 
+  summarise(bin_n = mean(Contribution),
+            mean = mean(value),
+            median = median(value),
+            sd = sd(value),
+            u_east  = mean(WS * sin(WD / 180*pi), na.rm=TRUE),
+            u_north = mean(WS * cos(WD / 180*pi), na.rm=TRUE),
+            WS = mean(WS)) %>% 
+  mutate(WD = (atan2(u_east, u_north) + pi) * 180 / pi)
+
+ggplot(pp_bin_cont, aes(bin_n, mean)) +
+  geom_point() +
+  geom_smooth(method='lm') +
+  facet_wrap(~name, scales='free_y')
+```
+
+```{r}
+ggplot(pp_bin_cont, aes(bin_n, WS)) +
+  geom_point() +
+  geom_smooth(method='lm') +
+  facet_wrap(~name, scales='free_y')
+
+ggplot(pp_bin_cont, aes(bin_n, WD)) +
+  geom_point() +
+  geom_smooth(method='lm') +
+  facet_wrap(~name, scales='free_y')
+```
+
+```{r}
+lm(FC ~ Contribution+WS+ATMP+STMP+SWIN, data=pp_data) %>% 
+  summary()
+```
+
+```{r}
+lm(FCH4 ~Contribution+ATMP+STMP+SWIN, data=pp_data) %>% 
+  summary()
+```
+
+
 # Try and account for variation
 
 ## FC
@@ -249,7 +397,7 @@ pp$data %>%
 ### MLR
 
 ```{r}
-mlr = lm(FC ~ Contribution + ATMP + SWIN + STMP, data=pp$data)
+mlr = lm(FC ~ Contribution + ATMP + SWIN + STMP, data=pp_data)
 summary(mlr)
 
 ggplot() +
@@ -262,7 +410,7 @@ ggplot() +
 
 ```{r}
 gam = gam(FC ~ s(Contribution, k=-1) + ATMP + s(SWIN, k=-1) + STMP,
-          data=pp$data)
+          data=pp_data)
 summary(gam)
 
 ggplot() +
@@ -277,7 +425,7 @@ ggplot() +
 
 ```{r}
 mlr = lm(FCH4 ~ Contribution*ATMP*SWIN*STMP*FC,
-         data=pp$data %>% drop_na()) # %>% select(FCH4, Contribution, ATMP, SWIN, STMP, FC) 
+         data=pp_data %>% drop_na()) # %>% select(FCH4, Contribution, ATMP, SWIN, STMP, FC) 
 mlr = step(mlr, trace=0)
 
 summary(mlr)
@@ -292,7 +440,7 @@ ggplot() +
 
 ```{r}
 gam = gam(FCH4 ~ s(Contribution, k=-1) + ATMP + s(SWIN, k=-1) + STMP + FC,
-          data=pp$data)
+          data=pp_data)
 
 summary(gam)
 
@@ -305,7 +453,7 @@ ggplot() +
 # PCA
 
 ```{r}
-pca_data = pp$data %>% 
+pca_data = pp_data %>% 
   select(FC, FCH4, ATMP, SWIN, Contribution, STMP) %>% 
   drop_na()
 
@@ -318,7 +466,6 @@ summary(pca)
 factoextra::fviz_pca_biplot(pca, geom='point')
 ```
 
-
 ```{r}
 factoextra::fviz_screeplot(pca)
 ```
@@ -326,7 +473,7 @@ factoextra::fviz_screeplot(pca)
 ## Add soil water content of the top layer
 
 ```{r}
-pca_data2 = pp$data %>% 
+pca_data2 = pp_data %>% 
   select(FC, FCH4, ATMP, SWIN, Contribution, STMP,
          SPG_SWCT_1_D_005_Avg, SPG_SWCT_1_D_015_Avg, SPG_SWCT_1_D_025_Avg) %>% 
   drop_na()
@@ -335,6 +482,186 @@ pca2 = prcomp(pca_data2, scale=TRUE)
 
 factoextra::fviz_pca_biplot(pca2, geom='point')
 ```
+
+
+# CB vs cb_grass
+
+## Load data
+
+```{r}
+# Set the start and end date to postprocess
+start_dt <- as_datetime('2020-05-17T00:00:00', tz='UTC')
+end_dt   <- as_datetime('2021-11-01T00:00:00', tz='UTC')
+
+db_path <- 'data/Zegveld.db'
+
+# Create the class and load the data
+pp = Postprocessing()
+pp$load_data(start_dt, end_dt, db=db_path)
+pp$load_pp_data(start_dt, end_dt, db=db_path, variables = c('Contribution', 'cb_grass'))
+
+pp$filter_co2()
+pp$filter_ch4()
+pp$flux_partitioning()
+```
+
+```{r}
+pp$data %>% 
+  rename(cb_typha = Contribution) %>% 
+  mutate(FC_typha = if_else(cb_typha > 0.75, FC, NaN),
+         FC_grass = if_else(cb_grass > 0.75, FC, NaN)) %>% 
+  select(datetime, FC_typha, FC_grass) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_line() +
+  facet_wrap(~name, ncol=1)
+```
+
+## Gapfill independently
+
+```{r}
+pp_typha = Postprocessing()
+pp_typha$data = pp$data
+pp_typha$data = pp_typha$data %>% 
+    mutate(across(c(FC, FCH4, NEE, GPP), ~if_else(Contribution > 0.8, .x, NaN)))
+
+pp_grass = Postprocessing()
+pp_grass$data = pp$data
+pp_grass$data = pp_grass$data %>% 
+  select(-Contribution) %>% 
+  rename(Contribution = cb_grass) %>% 
+  mutate(across(c(FC, FCH4, NEE, GPP), ~if_else(Contribution > 0.8, .x, NaN)))
+```
+
+```{r}
+nn_ensembles = vector('list', length=10)
+
+for(i in seq_along(nn_ensembles)) {
+  pp$gapfilling_nn()
+  pp_typha$gapfilling_nn()
+  pp_grass$gapfilling_nn()
+  
+  nn_ensembles[[i]] = bind_rows(pp$data %>%
+                                  select(datetime, FC_GF_NN) %>% 
+                                  mutate(lu = 'All',
+                                         run = i),
+                                pp_typha$data %>%
+                                  select(datetime, FC_GF_NN) %>% 
+                                  mutate(lu = 'Typha',
+                                         run = i),
+                                pp_grass$data %>%
+                                  select(datetime, FC_GF_NN) %>% 
+                                  mutate(lu = 'Grass',
+                                         run = i))
+  pp$data = pp$data %>% select(-FC_GF_NN)
+  pp_typha$data = pp_typha$data %>% select(-FC_GF_NN)
+  pp_grass$data = pp_grass$data %>% select(-FC_GF_NN)
+}
+
+fc_df = bind_rows(nn_ensembles) %>% 
+  group_by(datetime, lu) %>% 
+  summarise(FC_GF_NN_mean = mean(FC_GF_NN),
+            FC_GF_NN_sd = sd(FC_GF_NN))
+```
+
+```{r}
+fc_df_daily = fc_df %>% 
+  mutate(date = as_date(datetime-1)) %>% 
+  group_by(date, lu) %>% 
+  # µmol/m2/s -> g/m2/day
+  summarise(FC_GF_NN = sum(FC_GF_NN_mean) / 10^6 * 44/1000 * 10^4 * 1800,
+            .groups = 'drop')
+
+fc_df_daily %>% 
+  ggplot(aes(date, FC_GF_NN, col=lu)) +
+  geom_line() +
+  scale_x_date(date_breaks = '2 months', date_labels = '%Y-%b') +
+  labs(y='FC kg/ha/day')
+```
+
+### Budget
+
+```{r}
+fc_df_daily %>% 
+  mutate(YM = floor_date(date, 'month')) %>% 
+  group_by(YM, lu) %>% 
+  summarise(FC = sum(FC_GF_NN, na.rm=TRUE)) %>% 
+  pivot_wider(names_from=lu, values_from=FC)
+```
+
+```{r}
+fc_df_daily %>% 
+  mutate(Year = year(date)) %>% 
+  group_by(Year, lu) %>% 
+  summarise(FC = sum(FC_GF_NN, na.rm=TRUE)) %>% 
+  pivot_wider(names_from=lu, values_from=FC)
+```
+
+# FCH4
+
+```{r}
+rf_ensembles = vector('list', length=10)
+
+for(i in seq_along(rf_ensembles)) {
+  pp_typha$gapfill_ch4_rf()
+  pp_grass$gapfill_ch4_rf()
+  
+  rf_ensembles[[i]] = bind_rows(pp_typha$data %>%
+                                  select(datetime, FCH4_GF_RF) %>% 
+                                  mutate(lu = 'Typha',
+                                         run = i),
+                                pp_grass$data %>%
+                                  select(datetime, FCH4_GF_RF) %>% 
+                                  mutate(lu = 'Grass',
+                                         run = i))
+  pp_typha$data = pp_typha$data %>% select(-FCH4_GF_RF)
+  pp_grass$data = pp_grass$data %>% select(-FCH4_GF_RF)
+}
+
+fch4_df = bind_rows(rf_ensembles) %>% 
+  group_by(datetime, lu) %>% 
+  summarise(FCH4_GF_RF = mean(FCH4_GF_RF))
+```
+
+```{r}
+# fch4_df = bind_rows(
+#   pp_typha$data %>% 
+#     select(datetime, FCH4_GF_RF) %>% 
+#     mutate(lu = 'Typha'),
+#   pp_grass$data %>% 
+#     select(datetime, FCH4_GF_RF) %>% 
+#     mutate(lu = 'Grass')
+# ) %>% 
+fch4_df_daily = fch4_df %>% 
+  mutate(date = as_date(datetime-1)) %>% 
+  group_by(date, lu) %>% 
+  # µmol/m2/s -> g/m2/day
+  summarise(FCH4_GF_RF = sum(FCH4_GF_RF) / 10^6 * 16/1000 * 10^4 * 1800,
+            .groups = 'drop')
+
+fch4_df_daily %>% 
+  ggplot(aes(date, FCH4_GF_RF, col=lu)) +
+  geom_line() +
+  scale_x_date(date_breaks = '2 months', date_labels = '%Y-%b') +
+  labs(y='FCH4 kg/ha/day')
+```
+
+```{r}
+fch4_df_daily %>% 
+  mutate(YM = floor_date(date, 'month')) %>% 
+  group_by(YM, lu) %>% 
+  summarise(FCH4 = sum(FCH4_GF_RF, na.rm=TRUE)) %>% 
+  pivot_wider(names_from=lu, values_from=FCH4)
+```
+
+```{r}
+fch4_df_daily %>% 
+  mutate(Year = year(date)) %>% 
+  group_by(Year, lu) %>% 
+  summarise(FCH4 = sum(FCH4_GF_RF, na.rm=TRUE)) %>% 
+  pivot_wider(names_from=lu, values_from=FCH4)
+```
+
 
 <!-- ## Consider fetch with making relationship -->
 
@@ -389,7 +716,7 @@ factoextra::fviz_pca_biplot(pca2, geom='point')
 <!-- # Relationships with variables -->
 
 <!-- ```{r, fig.width=10, fig.height=8} -->
-<!-- pp$data %>% -->
+<!-- pp_data %>% -->
 <!--   select(FC, FCH4, NEE, GPP, Respiration, Contribution) %>% -->
 <!--   GGally::ggpairs() -->
 <!-- ``` -->
@@ -397,7 +724,7 @@ factoextra::fviz_pca_biplot(pca2, geom='point')
 <!-- ### Water levels -->
 
 <!-- ```{r, fig.width=10, fig.height=8} -->
-<!-- pp$data %>% -->
+<!-- pp_data %>% -->
 <!--   select(FC, FCH4, NEE, GPP, Respiration, paste0('WLG_WLEV_', c(1:6, 8))) %>% -->
 <!--   rename_with(.cols=contains('WLG_WLEV'), ~str_sub(.x, 5)) %>% -->
 <!--   GGally::ggpairs() -->
@@ -406,7 +733,7 @@ factoextra::fviz_pca_biplot(pca2, geom='point')
 <!-- ### Soil temperature -->
 
 <!-- ```{r, fig.width=14, fig.height=12} -->
-<!-- pp$data %>% -->
+<!-- pp_data %>% -->
 <!--   select(FC, FCH4, NEE, GPP, Respiration, contains('SPG_STMP_1')) %>% -->
 <!--   rename_with(.cols=contains('SPG_STMP'), ~paste(str_split_fixed(.x, '_', 6)[,5], 'cm')) %>% -->
 <!--   GGally::ggpairs() -->
@@ -415,7 +742,7 @@ factoextra::fviz_pca_biplot(pca2, geom='point')
 <!-- ### Soil water content -->
 
 <!-- ```{r, fig.width=14, fig.height=12} -->
-<!-- pp$data %>% -->
+<!-- pp_data %>% -->
 <!--   select(FC, FCH4, NEE, GPP, Respiration, contains('SPG_SWCT_1')) %>% -->
 <!--   rename_with(.cols=contains('SPG_SWCT'), ~paste(str_split_fixed(.x, '_', 6)[,5], 'cm')) %>% -->
 <!--   GGally::ggpairs() -->

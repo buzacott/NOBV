@@ -110,7 +110,7 @@ Training and testing performance
 pp$data %>% 
   filter(RF_src %in% c('train', 'test')) %>% 
   ggplot(aes(FCH4, FCH4_RF, col=RF_src)) + 
-  geom_point() +
+  geom_point(alpha=0.5) +
   geom_abline() +
   labs(x = 'Obs', y='Sim', col=NULL)
 ```
@@ -137,6 +137,13 @@ pp$data %>%
   labs(y = expression(value~'('*µmol.s^-1*.m^-2*')'), col=NULL) +
   facet_wrap(~year, ncol=1, scales='free_x')
 ```
+
+```{r}
+# Daily
+pp$data %>% 
+  select(datetime, FCH4_GF_RF)
+```
+
 
 ### Try and improve
 
@@ -178,20 +185,24 @@ model to calculate the flux footprint.
 Methods are available to calculate the percent contribution within area of
 interest and to return a timeseries raster brick.
 
+## Lisdodde
+
 ```{r}
 cb = Contribution(data = pp$data,
                   xy = c(117467, 461350),
                   epsg = 28992,
-                  shapefile = 'data/geodata/zegveld_perceel.gpkg')
+                  shapefile = 'data/geodata/zegveld_lisdodde.kml')
 ```
-
 
 ```{r}
 # The number of cores to use can be specified with parallel
-cb$calculate_contribution(keep_footprints = FALSE, parallel=8)
+cb$calculate_contribution(keep_footprints = FALSE, parallel=6)
 ```
 
-### Plot of contribution vs flux
+```{r}
+ggplot(cb$cdata, aes(WD, Contribution)) +
+  geom_point()
+```
 
 ```{r, warning=FALSE}
 pp$data %>% 
@@ -213,4 +224,43 @@ pp$data <- pp$data %>%
   mutate(Contribution = cb$cdata$Contribution)
 
 pp$upload_data(db=db_path, overwrite=TRUE)
+```
+
+## Grass east
+
+```{r}
+cb_grass = Contribution(data = pp$data,
+                        xy = c(117467, 461350),
+                        epsg = 28992,
+                        shapefile = 'data/geodata/zegveld_grass_east.kml')
+```
+
+```{r}
+cb_grass$calculate_contribution(keep_footprints = FALSE, parallel = 4)
+```
+
+```{r, warning=FALSE}
+pp$data %>% 
+  mutate(Contribution = cb_grass$cdata$Contribution) %>% 
+  select(Contribution, FCH4, FC) %>% 
+  pivot_longer(-Contribution) %>% 
+  ggplot(aes(Contribution, value)) +
+  geom_point() +
+  xlim(0, 1) + 
+  scale_y_continuous(expand=c(0.2, 0)) +
+  geom_smooth(method='lm') +
+  ggpmisc::stat_poly_eq(aes(label=paste(after_stat(eq.label), after_stat(adj.rr.label), sep = "*\", \"*"))) +
+  facet_wrap(~name, scales='free_y')
+```
+
+## Upload to database
+
+Updates the database with some of the variables calculated e.g., NEE, GPP, 
+gap-filled series, contribution.
+
+```{r}
+pp$data <- pp$data %>% 
+  mutate(cb_grass = cb_grass$cdata$Contribution)
+
+pp$upload_data(db=db_path, variables='cb_grass')
 ```
