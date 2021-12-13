@@ -82,6 +82,8 @@ data %>%
 
 ```{r, fig.height=8, fig.width=8}
 data %>% 
+  mutate(WD = WD + 180,
+         WD = if_else(WD > 360, WD - 360, WD)) %>% 
   ggplot(aes(WD, WD_met)) +
   geom_point() +
   geom_abline() +

@@ -42,6 +42,11 @@ db_path <- 'data/Zegveld.db'
 pp = Postprocessing()
 pp$load_data(start_dt, end_dt, db=db_path)
 
+# Fix WD
+pp$data = pp$data %>% 
+  mutate(WD = WD + 180,
+         WD = if_else(WD > 360, WD-360, WD))
+
 glimpse(pp$data)
 ```
 

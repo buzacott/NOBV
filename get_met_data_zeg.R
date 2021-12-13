@@ -19,7 +19,7 @@ Sys.setenv(TZ=tz)
 site = 'ZEG'
 
 # Number of months to download
-start_date = as_date('2021-11-01')
+start_date = as_date('2020-05-01')
 end_date   = as_date('2021-11-30')
 
 interval = interval(start_date, end_date)
@@ -105,15 +105,15 @@ mt1 <- lapply(mt1, function(df) {
     # Aggregate variables
     summarise(
       # Better averaging of wind direction, use wind vectors
-      u_east  = mean(MT1_WINS_1_H_200_Avg * sin(MT1_WIND_1_H_200_Avg / 180*pi), na.rm=TRUE),
-      u_north = mean(MT1_WINS_1_H_200_Avg * cos(MT1_WIND_1_H_200_Avg / 180*pi), na.rm=TRUE),
+      v_east  = mean(MT1_WINS_1_H_200_Avg * sin(MT1_WIND_1_H_200_Avg * pi/180), na.rm=TRUE),
+      v_north = mean(MT1_WINS_1_H_200_Avg * cos(MT1_WIND_1_H_200_Avg * pi/180), na.rm=TRUE),
       # Take mean of variables except wind dir and rain
       across(-c(MT1_RAIN_1_H_040_Tot, MT1_WIND_1_H_200_Avg), mean, na.rm=TRUE),
       # Sum rain
       MT1_RAIN_1_H_040_Tot = sum(MT1_RAIN_1_H_040_Tot, na.rm=TRUE),
     ) %>%
-    mutate(MT1_WIND_1_H_200_Avg = (atan2(u_east, u_north) + pi) * 180 / pi) %>%
-    select(-c(u_east, u_north))
+    mutate(MT1_WIND_1_H_200_Avg = (360 + (atan2(v_east, v_north) * 180/pi)) %% 360)   %>%
+    select(-c(v_east, v_north))
 })
 
 
