@@ -22,6 +22,33 @@ library(tictoc)
 theme_set(theme_bw())
 
 source('src/postprocessing.R')
+
+variables = c(
+  # Fluxnet
+  'H', 'LE', 'G', 'FC','SC_SINGLE', 'FCH4', 'USTAR', 'WS', 'WD',
+  'DISPLACEMENT_HEIGHT', 'ROUGHNESS_LENGTH', 'MO_LENGTH', 'V_SIGMA',
+  'FC_SSITC_TEST', 'FCH4_SSITC_TEST', 'CO2_VM97_TEST', 'CH4_VM97_TEST',
+  'TA_EP', 'RH_EP', 'VPD_EP', 'TDEW',
+  'CUSTOM_RSSI_77_MEAN', 'CUSTOM_CO2_SIGNAL_STRENGTH_7500_MEAN',
+  # Meteo
+  'MT1_ATMP_1_H_200_Avg', 'MT1_SWIN_1_H_180', 'MT1_PAR_1_H_180',
+  'MT1_WIND_1_H_200_Avg', 'MT1_WINS_1_H_200_Avg', 'MT1_RHUM_1_H_200_Avg',
+  'MT1_NETL_1_H_180', 'MT1_NETS_1_H_180', 'MT1_RAIN_1_H_040_Tot',
+  'MT1_RNR_1_H_180', 'MT1_RPR_1_H_180', 'MT1_NIR_1_H_180',
+  # Soil
+  # 'SPG_STMP_1_D_005_Avg', 'SPG_SWCT_1_D_005_Avg',
+  # Groundwater
+  paste0('WLG_WTMP_', 1:8), paste0('WLG_WLEV_', 1:8),
+  'U_UNROT', 'V_UNROT', 'W_UNROT'
+)
+
+soil_vars = expand_grid(Group = 'SPG',
+                        Var = c('STMP', 'SWCT'),
+                        Site = as.character(1:3),
+                        Depth = str_pad(seq(5, 115, 10), width = 3, pad = '0')) %>% 
+  mutate(name = paste(Group, Var, Site, 'D', Depth, 'Avg', sep='_'))
+
+variables <- c(variables, soil_vars$name)
 ```
 
 # Postprocessing class
@@ -33,37 +60,541 @@ First set the start and end dates to extract from the example database.
 
 ```{r}
 # Set the start and end date to postprocess
-start_dt <- as_datetime('2021-08-01T00:00:00', tz='UTC')
-end_dt   <- as_datetime('2021-11-21T00:00:00', tz='UTC')
+start_dt <- as_datetime('2021-08-04T14:00:00', tz='UTC')
+end_dt   <- as_datetime('2022-05-01T00:00:00', tz='UTC')
 
-db_path <- 'data/Assendelft.db'
+db <- 'data/asd_mp_ec03.db'
+
+site_id = 'asd_mp_ec03'
+latlon = c(52.475250, 4.739614)
 
 # Create the class and load the data
-pp = Postprocessing()
-pp$load_data(start_dt, end_dt, db=db_path)
+pp = Postprocessing$new(site_id = site_id,
+                        latlon = latlon)
 
-glimpse(pp$data)
+pp$load_data(start_dt, end_dt, db=db, variables = variables)
+
+# Add variables
+pp$data <- pp$data %>% 
+  mutate(VPD = 6.1078 * (1 - RELH/100) * exp(17.08085 * ATMP/(234.175 + ATMP)),
+         # Gapfill with data from meteo station
+         WD_GF = if_else(is.na(WD), WD_met, WD),
+         WS_GF = if_else(is.na(WS), WS_met, WS))
+
 ```
 
-## Data filtering
+# EDA
 
-At the moment filtering is only done using Eddy Pro quality flags (QC flag == 1)
-and then outlier exclusion using simple quantile methods.
+## Raw flux data
 
 ```{r}
-pp$filter_co2()
-pp$filter_ch4()
+pp$data %>% 
+  select(datetime, FC, FCH4) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_line() +
+  facet_wrap(~name, ncol=1, scales='free_y') +
+  scale_x_datetime(date_breaks = '2 months')
 ```
 
-## Partition flux
+## Met data
+
+Read in KNMI data
 
 ```{r}
-pp$flux_partitioning(plot=TRUE)
+knmi_met_data <- read_csv(file.path('~/Data/ECProcessing/KNMI', site_id, 'processed/knmi_met_data.csv')) %>% 
+  rename_with(~paste0(.x, '_knmi'), -datetime) %>% 
+  mutate(SWIN_knmi = if_else(SWIN_knmi < 0, 0, SWIN_knmi))
+
+# Calculate wind height at EC tower height
+u_log_profile <- function(u, z1, z2, d, z0) {
+  # u: wind speed at height z1
+  # z1: height of instrument
+  # z2: height to estimate ws at 
+  # d: displacement height
+  # z0: roughness length
+  u * log( (z2-d)/z0 ) / log( (z1-d)/z0 )
+}
+
+knmi_met_data <- knmi_met_data %>% 
+  mutate(WS_knmi = u_log_profile(WS_10M_knmi, 10, 2.5, 0.2*0.67, 0.2*0.15))
+
+ggplot() +
+  geom_line(data = knmi_met_data, aes(datetime, WS_knmi, col='WS_knmi'), alpha=0.5) +
+  geom_line(data = pp$data, aes(datetime, WS, col='EC'), alpha=0.5) +
+  xlim(as_datetime('2022-02-01T00:00:00'), as_datetime('2022-05-01T00:00:00'))
+
+
+pp$data <- pp$data %>% 
+  select(-any_of(colnames(knmi_met_data)[-1])) %>% 
+  left_join(knmi_met_data %>% select(-WS_10M_knmi))
 ```
 
-## Gapfilling
+```{r}
+pp$data %>% 
+  select(datetime, WD, WD_knmi, RELH, RELH_knmi, SWIN, SWIN_knmi,
+         DTMP=TDEW, DTMP_knmi, ATMP, ATMP_knmi,
+         WS, WS_knmi) %>% 
+  pivot_longer(-datetime) %>% 
+  separate(name, c('var', 'name')) %>% 
+  mutate(name = if_else(is.na(name), 'EC', name)) %>% 
+  pivot_wider() %>% 
+  ggplot(aes(EC, knmi)) +
+  geom_point() +
+  geom_abline() +
+  facet_wrap(~var, scales='free')
+```
 
-### CO2
+```{r}
+# ggplot(pp$data, aes(WD, WD_knmi)) +
+#   geom_point() +
+#   facet_wrap(~strftime(datetime-1, '%Y-%m')) +
+#   geom_abline()
+# 
+# ggplot(pp$data, aes(WS, WS_knmi)) +
+#   geom_point() +
+#   facet_wrap(~strftime(datetime-1, '%Y-%m')) +
+#   geom_abline()
+# 
+# ggplot(pp$data, aes(ATMP, ATMP_knmi)) +
+#   geom_point() +
+#   facet_wrap(~strftime(datetime-1, '%Y-%m')) +
+#   geom_abline()
+# 
+# ggplot(pp$data, aes(RELH, RELH_knmi)) +
+#   geom_point() +
+#   facet_wrap(~strftime(datetime-1, '%Y-%m')) +
+#   geom_abline()
+# 
+# ggplot(pp$data, aes(SWIN, SWIN_knmi)) +
+#   geom_point() +
+#   facet_wrap(~strftime(datetime-1, '%Y-%m')) +
+#   geom_abline()
+# 
+# ggplot(pp$data, aes(TDEW, DTMP_knmi)) +
+#   geom_point() +
+#   facet_wrap(~strftime(datetime-1, '%Y-%m')) +
+#   geom_abline()
+```
+
+## Examine soil and water variables
+
+```{r}
+pp$data %>% 
+  select(datetime, contains('SPG_STMP')) %>% 
+  pivot_longer(-datetime) %>% 
+  mutate(site = sapply(str_split(name, '_'), function(x) x[3]),
+         depth = sapply(str_split(name, '_'), function(x) x[5])) %>% 
+  ggplot(aes(datetime, value, col=site)) +
+  geom_line() +
+  scale_x_datetime(breaks = '1 month', date_labels = '%b') +
+  facet_wrap(~depth)
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, contains('SPG_SWCT')) %>% 
+  pivot_longer(-datetime) %>% 
+  mutate(site = sapply(str_split(name, '_'), function(x) x[3]),
+         depth = sapply(str_split(name, '_'), function(x) x[5])) %>% 
+  ggplot(aes(datetime, value, col=site)) +
+  geom_line() +
+  labs(y='SWCT') +
+  facet_wrap(~depth)
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, contains('WLG_WLEV')) %>% 
+  pivot_longer(-datetime) %>% 
+  mutate(var = sapply(str_split(name, '_'), function(x) x[2]),
+         site = sapply(str_split(name, '_'), function(x) x[3])) %>% 
+  ggplot(aes(datetime, value, col=site)) +
+  geom_line() +
+  labs(y='Water level (cm)')
+
+p2 = pp$data %>% 
+   filter(datetime > as_datetime('2022-03-01T00:00:00')) %>% 
+  select(datetime, contains('WLG_WLEV')) %>% 
+  pivot_longer(-datetime) %>% 
+  mutate(var = sapply(str_split(name, '_'), function(x) x[2]),
+         site = sapply(str_split(name, '_'), function(x) x[3])) %>% 
+  filter(site %in% as.character(c(2, 3, 4))) %>% 
+  ggplot(aes(datetime, value, col=site)) +
+  geom_line() +
+  scale_x_datetime(breaks = '1 month', date_labels = '%b') +
+  labs(y='Water level (cm)')
+```
+
+
+```{r}
+pp$data %>% 
+  select(datetime, contains('WLG_WTMP')) %>% 
+  pivot_longer(-datetime) %>% 
+  mutate(var = sapply(str_split(name, '_'), function(x) x[2]),
+         site = sapply(str_split(name, '_'), function(x) x[3])) %>% 
+  ggplot(aes(datetime, value, col=site)) +
+  geom_line() +
+  labs(y='Water temp (degC)')
+
+pp$data %>% 
+  select(datetime, contains('WLG_WTMP')) %>% 
+  pivot_longer(-datetime) %>% 
+  mutate(var = sapply(str_split(name, '_'), function(x) x[2]),
+         site = sapply(str_split(name, '_'), function(x) x[3])) %>% 
+  filter(site %in% as.character(c(2, 3, 4))) %>% 
+  ggplot(aes(datetime, value, col=site)) +
+  geom_line() +
+  labs(y='Water temp (degC)')
+```
+
+# Data filtering
+
+This step:
+
+- Removes poor quality data flagged by EddyPro
+
+### EddyPro Flags
+
+```{r}
+pp$filter_co2(vm97 = TRUE, CO2_SS_threshold = 70)
+pp$filter_ch4(vm97 = TRUE, CH4_SS_threshold = 10)
+```
+
+## Rain filter
+
+```{r}
+n <- nrow(pp$data)
+rain_idx <- which(pp$data$MT1_RAIN_1_H_040_Tot > 0)
+rain_idx <- unique(c(rain_idx, rain_idx+1))
+rain_idx <- 1:n %in% rain_idx
+rain_idx[is.na(pp$data$MT1_RAIN_1_H_040_Tot)] <- NA
+
+ggplot(pp$data, aes(datetime, FC_f, col=rain_idx)) +
+  geom_point()
+```
+
+```{r}
+pp$filter_rain()
+```
+
+## Filter outliers
+
+Visually inspect the data and remove outliers
+
+```{r}
+pp$data %>% 
+  select(datetime, FC_f, NEE_f) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_line() +
+  facet_wrap(~name, ncol = 1)
+
+pp$data %>% 
+  select(FC_f, NEE_f) %>% 
+  pivot_longer(everything()) %>% 
+  ggplot(aes(value)) +
+  geom_histogram() +
+  facet_wrap(~name)
+```
+
+```{r}
+summary(pp$data$FC_f)
+quantile(pp$data$FC_f, c(0, 0.0001, 0.001, 0.01), na.rm=TRUE)
+quantile(pp$data$FC_f, c(0.99, 0.995, 0.999, 0.99925, 0.9995, 0.9999, 1), na.rm=TRUE)
+
+pp$data %>% 
+  select(datetime, FC_f, NEE_f) %>% 
+  pivot_longer(-datetime) %>% 
+  group_by(name) %>% 
+  mutate(value = if_else(value <= quantile(value, 0.005, na.rm=TRUE)  |
+                           value >= quantile(value, 0.995, na.rm=TRUE)
+                         , NaN, value)) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_line()
+
+pp$data %>% 
+  select(FC_f, NEE_f) %>% 
+  pivot_longer(everything()) %>% 
+  group_by(name) %>% 
+  mutate(value = if_else(value < quantile(value, 0.005, na.rm=TRUE)  |
+                           value > quantile(value, 0.995, na.rm=TRUE)
+                         , NaN, value)) %>% 
+  ggplot(aes(value)) +
+  geom_histogram() +
+  facet_wrap(~name)
+
+pp$data %>% 
+  select(FC_f, NEE_f, month) %>% 
+  pivot_longer(-month) %>% 
+  group_by(name) %>% 
+  mutate(value = if_else(value < quantile(value, 0.005, na.rm=TRUE)  |
+                           value > quantile(value, 0.995, na.rm=TRUE)
+                         , NaN, value)) %>% 
+  ggplot(aes(value)) +
+  geom_histogram() +
+  facet_wrap(~name)
+```
+
+```{r}
+summary(pp$data$FCH4_f)
+quantile(pp$data$FCH4_f, c(0, 0.0001, 0.001, 0.01), na.rm=TRUE)
+quantile(pp$data$FCH4_f, c(0.99, 0.995, 0.999, 0.99925, 0.9995, 0.9999, 1), na.rm=TRUE)
+
+pp$data %>% 
+  select(datetime, FCH4_f) %>% 
+  mutate(FCH4_f = if_else(FCH4_f < quantile(FCH4_f, 0, na.rm=TRUE)  |
+                           FCH4_f > quantile(FCH4_f, 0.995, na.rm=TRUE),
+                          NaN, FCH4_f)) %>% 
+  ggplot(aes(datetime, FCH4_f)) +
+  geom_line()
+
+
+pp$data %>% 
+  select(datetime, FCH4_f) %>% 
+  mutate(FCH4_f = if_else(FCH4_f < quantile(FCH4_f, 0.005, na.rm=TRUE)  |
+                           FCH4_f > quantile(FCH4_f, 0.995, na.rm=TRUE),
+                          NaN, FCH4_f)) %>% 
+  ggplot(aes(FCH4_f)) +
+  geom_histogram()
+```
+
+```{r}
+pp$filter_outlier_co2(lower = 0.005, upper = 0.995)
+pp$filter_outlier_ch4(lower = 0.005, upper = 0.995)
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, FC_f, NEE_f, FCH4_f) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_line() +
+  facet_wrap(~name, ncol=1, scales='free_y') +
+  scale_x_datetime(date_breaks = '2 months')
+
+pp$data %>% 
+  select(FC_f, NEE_f, FCH4_f) %>% 
+  pivot_longer(everything()) %>% 
+  group_by(name) %>% 
+  ggplot(aes(value)) +
+  geom_histogram() +
+  facet_wrap(~name, scales='free_x')
+```
+
+### Manual spike removal
+
+```{r}
+summary(pp$data$NEE_f)
+summary(pp$data$FCH4_f)
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, NEE_f) %>% 
+  arrange(desc(NEE_f))
+
+pp$data %>% 
+  ggplot(aes(datetime, NEE_f)) +
+  geom_line()
+
+pp$data %>% 
+  select(datetime, FCH4_f) %>% 
+  arrange(desc(FCH4_f))
+
+ggplot(pp$data, aes(datetime, FCH4_f)) +
+  geom_line()
+```
+
+
+
+```{r}
+bad_ts <- as_datetime(c(# NEE
+                        '2021-12-21 20:00:00',
+                        '2021-09-07 00:00:00',
+                        '2022-01-27 09:00:00',
+                        # FCH4
+                        '2021-08-11 20:30:00',
+                        '2022-01-15 09:00:00',
+                        '2022-01-15 07:30:00',
+                        '2021-12-27 09:30:00'))
+
+pp$data <- pp$data %>% 
+  mutate(across(c(FC_f, NEE_f, FCH4_f), ~if_else(datetime %in% bad_ts, NaN, .x))) 
+
+pp$data %>% 
+  ggplot(aes(datetime, NEE_f)) +
+  geom_line()
+
+pp$data %>% 
+  ggplot(aes(datetime, FCH4_f)) +
+  geom_line()
+```
+
+### u* filtering
+
+- Estimates ustar threshold using the MPT method for FC/NEE via REddyProc
+  - Currently only a single threshold value is used rather than year/season
+  
+#### Check u\* flux relationships
+
+```{r}
+pp$data %>% 
+  select(USTAR, NEE_f, night, WD, SWIN) %>% 
+  filter(night == 1, SWIN < 5) %>% 
+  drop_na() %>% 
+  ggplot(aes(USTAR, NEE_f)) +
+  geom_point(alpha = 0.2) +
+  ylim(-50, 50) +
+  xlim(0, NaN)
+
+pp$data %>% 
+  select(USTAR, NEE_f, night, WD, SWIN) %>% 
+  filter(night == 1, SWIN < 5, USTAR < 0.3) %>% 
+  drop_na() %>% 
+  ggplot(aes(USTAR, NEE_f)) +
+  geom_point(alpha = 0.2) +
+  ylim(-50, 50) +
+  xlim(0, NaN)
+```
+
+```{r}
+pp$filter_ustar(min_ustar_threshold = 0.10)
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, USTAR, NEE_f, FCH4_f) %>% 
+  # mutate(across(c(NEE_f, FCH4_f), ~if_else(USTAR < 0.15, NaN, .x))) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_line() +
+  facet_wrap(~name, ncol=1, scales='free_y') +
+  scale_x_datetime(date_breaks = '2 months')
+```
+
+#### Post u* filter check
+
+```{r}
+pp$data %>% 
+  select(datetime, NEE_f, FCH4_f) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_line() +
+  facet_wrap(~name, ncol=1, scales='free_y') +
+  scale_x_datetime(date_breaks = '2 months')
+```
+
+## Check data
+
+Check data coverage filtering
+
+```{r, fig.width=8, fig.height=4}
+pp$data %>% 
+  select(datetime, NEE_f) %>% 
+  mutate(hour = hour(datetime),
+         yday = yday(datetime)) %>% 
+  drop_na() %>% 
+  ggplot(aes(hour, yday, fill=NEE_f)) +
+  geom_tile() +
+  scale_y_continuous(breaks = yday(as_date('2021-01-01') %m+% months(0:11)),
+                     labels = month.abb,
+                     limits = c(0, 366),
+                     expand = c(0,0)) +
+  scale_x_continuous(breaks = seq(0, 22, 2), expand = c(0,0)) + 
+  viridis::scale_fill_viridis() +
+  labs(x='Hour', y='Month') +
+  facet_wrap(~year(datetime), nrow = 1)
+
+pp$data %>% 
+  select(datetime, FCH4_f) %>% 
+  mutate(hour = hour(datetime),
+         yday = yday(datetime)) %>% 
+  drop_na() %>% 
+  ggplot(aes(hour, yday, fill=FCH4_f)) +
+  geom_tile() +
+  scale_y_continuous(breaks = yday(as_date('2021-01-01') %m+% months(0:11)),
+                     labels = month.abb,
+                     limits = c(0, 366),
+                     expand = c(0,0)) +
+  scale_x_continuous(breaks = seq(0, 22, 2), expand = c(0,0)) + 
+  viridis::scale_fill_viridis() +
+  labs(x='Hour', y='Month') +
+  facet_wrap(~year(datetime), nrow = 1)
+```
+
+# Partition flux
+
+```{r}
+pp$flux_partitioning(plot=TRUE, annual=FALSE)
+```
+
+Lasslop et al. 2010 approach
+
+```{r}
+pp$flux_partitioning_ll(plot=TRUE)
+```
+
+Using REddyProc
+
+```{r}
+pp$flux_partitioning_eproc(plot=TRUE)
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, contains('eproc')) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value, col=name)) +
+  geom_line()
+```
+
+## Comparison
+
+```{r}
+pp$data %>% 
+  select(datetime, GPP_ll, GPP, GPP_eproc) %>% 
+  mutate(GPP = -GPP) %>% 
+  pivot_longer(-datetime) %>% 
+  mutate(date = as_date(datetime-1)) %>% 
+  group_by(date, name) %>%
+  summarise(value = mean(value)) %>% 
+  ggplot(aes(date, value, col=name)) +
+  geom_line()
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, Reco_ll, Reco, Reco_eproc) %>% 
+  pivot_longer(-datetime) %>% 
+  mutate(date = as_date(datetime-1)) %>% 
+  group_by(date, name) %>%
+  summarise(value = mean(value)) %>% 
+  ggplot(aes(date, value, col=name)) +
+  geom_line()
+```
+
+```{r}
+ggplot(pp$data) +
+  geom_line(aes(datetime, Reco, col='Reco')) +
+  geom_line(aes(datetime, Reco_eproc, col='Reco_eproc')) +
+  geom_line(aes(datetime, Reco_ll, col='Reco_ll'))
+```
+
+```{r}
+pp$data %>%
+  select(datetime, Reco, Reco_eproc) %>% 
+  mutate(datetime = floor_date(datetime, 'month')) %>% 
+  pivot_longer(-datetime) %>% 
+  group_by(datetime, name) %>% 
+  summarise(value = mean(value, na.rm=TRUE)) %>% 
+  ggplot(aes(datetime, value, col=name)) +
+  geom_point()
+```
+
+# Gapfilling
+
+## CO2
 
 Non-linear regression and neural network approaches.
 
@@ -74,18 +605,88 @@ pp$gapfilling_nn()
 
 ```{r}
 pp$data %>% 
-  select(datetime, NEE, FC_GF_NLR, FC_GF_NN) %>% 
-  pivot_longer(-datetime) %>% 
+  select(year, datetime, NEE_f, NEE_GF_NLR, NEE_GF_NN) %>% 
+  add_row(datetime = as_datetime('2021-01-01T00:00:30'),
+          year = 2021) %>% 
+  add_row(datetime = as_datetime('2023-01-01T00:00:00'),
+          year = 2022) %>% 
+  pivot_longer(-c(year, datetime)) %>% 
+  mutate(name = factor(name, levels=c('NEE_GF_NLR', 'NEE_GF_NN', 'NEE_f'))) %>% 
   ggplot(aes(datetime, value, col=name)) +
-  geom_line()
+  geom_line() +
+  facet_wrap(~year, ncol=1, scales='free_x')
 ```
 
-### CH4
+```{r}
+pp$data %>% 
+  select(datetime, NEE_GF_NLR) %>% 
+  mutate(hour = hour(datetime),
+         yday = yday(datetime)) %>% 
+  drop_na() %>% 
+  ggplot(aes(hour, yday, fill=NEE_GF_NLR)) +
+  geom_tile() +
+  scale_y_continuous(breaks = yday(as_date('2021-01-01') %m+% months(0:11)),
+                     labels = month.abb,
+                     limits = c(0, 366),
+                     expand = c(0,0)) +
+  scale_x_continuous(breaks = seq(0, 22, 2), expand = c(0,0)) + 
+  viridis::scale_fill_viridis() +
+  labs(x='Hour', y='Month') +
+  facet_wrap(~year(datetime), nrow = 1)
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, NEE_GF_NN) %>% 
+  mutate(hour = hour(datetime),
+         yday = yday(datetime)) %>% 
+  drop_na() %>% 
+  ggplot(aes(hour, yday, fill=NEE_GF_NN)) +
+  geom_tile() +
+  scale_y_continuous(breaks = yday(as_date('2021-01-01') %m+% months(0:11)),
+                     labels = month.abb,
+                     limits = c(0, 366),
+                     expand = c(0,0)) +
+  scale_x_continuous(breaks = seq(0, 22, 2), expand = c(0,0)) + 
+  viridis::scale_fill_viridis() +
+  labs(x='Hour', y='Month') +
+  facet_wrap(~year(datetime), nrow = 1)
+```
+
+## CH4
 
 Random Forest
 
 ```{r}
-pp$gapfill_ch4_rf()
+training_variables <- c('ATMP',
+                        'SWIN',
+                        'WS_GF',
+                        #'STMP',
+                        'SPG_STMP_2_D_005_Avg',
+                        'SPG_SWCT_2_D_005_Avg',
+                        #sprintf('SPG_SWCT_2_D_%03d_Avg', seq(5, 65, 10)),
+                        #sprintf('SPG_STMP_2_D_%03d_Avg', seq(15, 65, 10)),
+                        'WLG_WLEV_3',
+                        'WLG_WTMP_3',
+                        'day_sin')
+
+pp$gapfill_ch4_rf(training_variables = training_variables)
+```
+
+```{r}
+plot(pp$ch4_rf)
+```
+
+```{r}
+importance(pp$ch4_rf) %>% 
+  as_tibble(rownames = 'var') %>% 
+  pivot_longer(-var) %>% 
+  group_by(name) %>%
+  arrange(value) %>% 
+  mutate(var = factor(var, levels=var)) %>% 
+  ggplot(aes(value, var)) +
+  geom_point() +
+  facet_wrap(~name, scales='free_x')
 ```
 
 Training and testing performance
@@ -94,7 +695,7 @@ Training and testing performance
 pp$data %>% 
   filter(RF_src %in% c('train', 'test')) %>% 
   ggplot(aes(FCH4, FCH4_RF, col=RF_src)) + 
-  geom_point() +
+  geom_point(alpha=0.5) +
   geom_abline() +
   labs(x = 'Obs', y='Sim', col=NULL)
 ```
@@ -113,18 +714,131 @@ pp$data %>%
 ```
 
 ```{r}
-ggplot(pp$data) +
+# Replace final missing values with monthly median
+pp$data = pp$data %>% 
+  group_by(year, month) %>% 
+  mutate(FCH4_GF_RF = if_else(is.na(FCH4_GF_RF), median(FCH4, na.rm=TRUE), FCH4_GF_RF)) %>% 
+  ungroup()
+
+pp$data %>% 
+  mutate(year = year(datetime)) %>% 
+  ggplot() +
   geom_line(aes(datetime, FCH4_GF_RF, col='FCH4_GF_RF')) +
-  geom_line(aes(datetime, FCH4, col='FCH4')) +
-  labs(y = expression(value~'('*µmol.s^-1*.m^-2*')'), col=NULL)
+  geom_line(aes(datetime, FCH4_f, col='FCH4')) +
+  labs(y = expression(value~'('*µmol.s^-1*.m^-2*')'), col=NULL) +
+  facet_wrap(~year, ncol=1, scales='free_x')
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, FCH4_GF_RF) %>% 
+  mutate(hour = hour(datetime),
+         yday = yday(datetime)) %>% 
+  drop_na() %>% 
+  ggplot(aes(hour, yday, fill=FCH4_GF_RF)) +
+  geom_tile() +
+  scale_y_continuous(breaks = yday(as_date('2021-01-01') %m+% months(0:11)),
+                     labels = month.abb,
+                     limits = c(0, 366),
+                     expand = c(0,0)) +
+  scale_x_continuous(breaks = seq(0, 22, 2), expand = c(0,0)) + 
+  viridis::scale_fill_viridis() +
+  labs(x='Hour', y='Month') +
+  facet_wrap(~year(datetime), nrow = 1)
 ```
 
 # Upload to database
 
-Updates the database with some of the variables calculated e.g., NEE, GPP, 
-gap-filled series, contribution.
+Updates the database with some of the variables calculated e.g., NEE, GPP, gap-filled series, contribution.
 
 ```{r}
-pp$upload_data(db=db_path)
+pp$upload_data(db=db,
+               variables = c('NEE_f', 'FCH4_f',
+                             'GPP', 'Reco',
+                             'nlr_NEE', 'nn_NEE',
+                             'NEE_GF_NLR', 'NEE_GF_NN',
+                             'FCH4_RF', 'FCH4_GF_RF',
+                             'GPP_ll', 'NEE_ll', 'Reco_ll',
+                             'NEE_eproc', 'GPP_eproc', 'Reco_eproc'),
+               overwrite=TRUE)
+```
+
+
+# Correlation to NDVI
+
+```{r}
+data <- pp$data %>% 
+  mutate(date = as_date(datetime-1)) %>%
+  select(datetime, date, night, NEE_f, NEE_GF_NLR, PAR_met, GPP, GPP_eproc, GPP_ll,
+         RNR = MT1_RNR_1_H_180, RPR = MT1_RPR_1_H_180, NIR = MT1_NIR_1_H_180) %>% 
+  mutate(RNR = if_else(RNR > 0, RNR, NaN),
+         RPR = if_else(RPR > 0, RPR, NaN),
+         NDVI = (RNR-RPR)/(RNR+RPR))
+```
+
+```{r}
+data %>% 
+  select(RNR, RPR, NIR, NDVI) %>% 
+  pivot_longer(everything()) %>% 
+  ggplot(aes(value)) +
+  geom_histogram() +
+  facet_wrap(~name, scales='free')
+```
+
+```{r}
+data %>% 
+  filter(!night) %>% 
+  select(RNR, RPR, NIR, NDVI) %>% 
+  pivot_longer(everything()) %>% 
+  ggplot(aes(value)) +
+  geom_histogram() +
+  facet_wrap(~name, scales='free')
+```
+
+
+```{r}
+data %>% 
+  filter(NDVI > -1, NDVI < 1, GPP < 0) %>% 
+  ggplot(aes(NDVI, GPP)) +
+  geom_point()
+```
+
+```{r}
+data_day = data %>% 
+  filter(!night) %>%
+  group_by(date) %>% 
+  summarise(across(-datetime, ~mean(.x, na.rm=TRUE)))
+```
+
+
+```{r}
+data_day %>% 
+  filter(NDVI > -1, NDVI < 1, GPP < 0) %>% 
+  ggplot(aes(NDVI, NEE_GF_NLR)) +
+  geom_point()
+```
+
+
+```{r}
+ggplot(data_day, aes(date, NDVI)) +
+  geom_line() +
+  ylim(NA, 1)
+
+p2 = ggplot(data_day, aes(date, GPP_ll)) +
+  geom_line()
+
+
+data_day %>% 
+  select(date, NDVI, GPP) %>% 
+  pivot_longer(-date) %>% 
+  ggplot(aes(date, value)) +
+  geom_line() +
+  facet_wrap(~name, ncol=1, scales='free_y')
+```
+
+
+```{r}
+ggplot(data_day, aes(PAR_met, GPP_eproc, col=NDVI)) +
+  geom_point()
 ```
 

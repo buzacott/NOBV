@@ -64,7 +64,8 @@ get_db_data <- function(site,
                dt >= start_dt,
                dt <= end_dt) %>% 
         select(id = logicid, dt, value) %>% 
-        collect() 
+        mutate(dt = timezone('UTC', dt)) %>% 
+        collect()
       
       # Add the sensor info to the tbl
       sensor_data = left_join(sensor_id %>% select(id, name, unit_id = unit),

@@ -2,67 +2,25 @@ library(tidyverse)
 library(lubridate)
 library(dbplyr)
 
-#------------------------------------------------------------------------------#
-# Functions
-#------------------------------------------------------------------------------#
-get_fluxnet <- function(x) {
-  src = file.path(eddypro_dir, year(x), format(x, '%m'))
-  f = list.files(src, 'fluxnet')
-  if(length(f) == 1) {
-    df = read_csv(file.path(src, f)) %>% 
-      rename(datetime = TIMESTAMP_END) %>% 
-      select(datetime, any_of(default_fluxnet_variables)) %>% 
-      mutate(datetime = as_datetime(as.character(datetime),
-                                    format = '%Y%m%d%H%M',
-                                    tz = 'UTC')) %>% 
-      filter(datetime >= start_dt, datetime <= end_dt)
-  } else {
-    df = tibble()
-  }
-  return(df)
-}
+source('src/db_helper.R')
 
-get_meteo <- function(x) {
-  src = file.path(db_data_dir, year(x), format(x, '%m'))
-  
-  mt1 <- read_csv(file.path(src, paste0(strftime(x, '%Y-%m_MT1.csv'))))
-  spg <- read_csv(file.path(src, paste0(strftime(x, '%Y-%m_SPG.csv'))))
-  # WLG doesn't always exist
-  wlg_file = file.path(src, paste0(strftime(x, '%Y-%m_WLG.csv')))
-  if(file.exists(wlg_file)) {
-    wlg <- read_csv(wlg_file)
-    df <- reduce(list(mt1,spg,wlg), left_join)
-  } else {
-    df <- left_join(mt1, spg)
-  }
-  
-  # Filter dates
-  df <- df %>% 
-    rename(datetime = dt) %>% 
-    filter(datetime >= start_dt, datetime <= end_dt)
-  
-  return(df)
-}
-
-default_fluxnet_variables <- 
-  c('H', 'LE', 'ET', 'FC', 'FCH4', 'SC_SINGLE', 'WS', 'WS_MAX', 'WD', 'WD_SIGMA', 'USTAR', 'MO_LENGTH',
-    'T_SONIC', 'TA_EP', 'PA_EP', 'RH_EP', 'VPD_EP', 'TDEW', 'U_SIGMA', 'V_SIGMA', 'W_SIGMA',
-    'FC_SSITC_TEST', 'FCH4_SSITC_TEST', 'BADM_LOCATION_LAT', 'BADM_LOCATION_LONG','BADM_INST_HEIGHT_SA', 
-    'BADM_HEIGHTC', 'DISPLACEMENT_HEIGHT', 'ROUGHNESS_LENGTH', 'CUSTOM_RSSI_77_MEAN', 'CUSTOM_CO2_SIGNAL_STRENGTH_7500_MEAN',
-    'ALBEDO_1_1_1', 'LW_IN_1_1_1', 'LW_OUT_1_1_1', 'PTEMP_1_1_1', 'RH_1_1_1', 'RH_1_2_1', 'RH_1_3_1', 'SW_IN_1_1_1', 'SW_OUT_1_1_1', 'TA_1_1_1', 'TA_1_2_1', 'TA_1_3_1', 'TS_1_1_1', 'TS_1_2_1', 'VIN_1_1_1', 'WL_1_1_1', 'TW_1_1_1')
 #------------------------------------------------------------------------------#
 
 # Dates to extract and write to DB
-start_dt <- as_datetime('2020-05-01T00:00:01')
-end_dt   <- as_datetime('2021-12-01T00:00:00')
+start_dt <- as_datetime('2020-05-14T03:30:00', tz='UTC')
+#end_dt   <- as_datetime('2022-03-01T00:00:00', tz='UTC')
+# start_dt <- as_datetime('2022-03-01T00:30:00', tz='UTC')
+end_dt   <- as_datetime('2022-05-01T00:00:00', tz='UTC')
+
+site_id <- 'zeg_pt_ec01'
 
 # Path to eddy pro output (fluxnet files)
-eddypro_dir = '~/Data/Zegveld/processed'
+eddypro_dir = file.path('~/Data/ECProcessing/processed', site_id)
 # Path to data extracted from NOBV database
-db_data_dir = '~/Data/Zegveld/Data/processed'
+db_data_dir = file.path('~/Data/ECProcessing/met_data', site_id, 'processed')
 
 # Path/name of DB to create/write to
-db = "data/Zegveld.db"
+db = file.path("data", paste0(site_id, '.db'))
 
 # Check if the DB exists
 db_exists = file.exists(db)
@@ -91,10 +49,9 @@ if(strftime(end_dt, '%d%H%M') == '010000') {
 }
 months = floor_date(start_dt, 'month') %m+% months(0:(interval %/% months(1)))
 
-# Bind list. Replace -9999 with NA and parse datetimes
+# Bind list
 fluxnet <- lapply(months, get_fluxnet) %>% 
-  bind_rows() %>% 
-  mutate(across(where(is.numeric), ~na_if(., -9999)))
+  bind_rows()
 
 # Read in monthly dfs of meteo, soil and water level data
 db_data = lapply(months, get_meteo) %>% 

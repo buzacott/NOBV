@@ -1,5 +1,5 @@
 ---
-title: "Postprocessing"
+title: "Zegveld EC analysis"
 author: "Alexander Buzacott"
 date: "`r Sys.Date()`"
 output: html_document
@@ -7,12 +7,8 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-library(dplyr)
+library(tidyverse)
 library(dbplyr)
-library(readr)
-library(tidyr)
-library(stringr)
-library(ggplot2)
 library(DBI)
 library(raster, exclude = 'select')
 library(lubridate)
@@ -22,34 +18,68 @@ library(tictoc)
 theme_set(theme_bw())
 
 source('src/postprocessing.R')
+source('src/contribution.R')
+
+variables = c('H', 'LE', 'G', 'FC','SC_SINGLE', 'FCH4', 'USTAR',
+              'DISPLACEMENT_HEIGHT', 'ROUGHNESS_LENGTH',
+        'MT1_ATMP_1_H_200_Avg', 'WS', 'WD', 'MO_LENGTH', 'V_SIGMA',
+        'MT1_SWIN_1_H_180','FC_SSITC_TEST', 'FCH4_SSITC_TEST',
+        'MT1_PAR_1_H_180', 'MT1_WIND_1_H_200_Avg', 'MT1_WINS_1_H_200_Avg',
+        'MT1_NETL_1_H_180', 'MT1_NETS_1_H_180', 'SPG_STMP_1_D_005_Avg',
+        'MT1_RHUM_1_H_200_Avg', 'TS_1_1_1', 'TA_1_1_1', 'VPD_EP',
+        'CO2_VM97_TEST', 'CH4_VM97_TEST', 'MT1_RAIN_1_H_040_Tot', 'TDEW',
+        'CUSTOM_RSSI_77_MEAN', 'CUSTOM_CO2_SIGNAL_STRENGTH_7500_MEAN',
+        paste0('FETCH_', c(10, 30, 50, 70, 80, 90)), 'FETCH_MAX', 'FETCH_OFFSET',
+        'TA_EP', 'PA_EP')
+
+get_density <- function(x, y, ...) {
+  dens <- MASS::kde2d(x, y, ...)
+  ix <- findInterval(x, dens$x)
+  iy <- findInterval(y, dens$y)
+  ii <- cbind(ix, iy)
+  return(dens$z[ii])
+}
 ```
 
-# Postprocessing class
-
-This document demonstrates the functions in the `Postprocessing()` class. The 
-class methods can be viewed in `src/postprocessing.R`.
-
-First set the start and end dates to extract from the example database.
+## Load data
 
 ```{r}
 # Set the start and end date to postprocess
 start_dt <- as_datetime('2020-05-14T00:00:00', tz='UTC')
-end_dt   <- as_datetime('2021-12-01T00:00:00', tz='UTC')
+end_dt   <- as_datetime('2022-05-01T00:00:00', tz='UTC')
 
-db_path <- 'data/Zegveld.db'
+#start_dt <- as_datetime('2021-12-01T00:00:00', tz='UTC')
+#end_dt   <- as_datetime('2022-01-01T00:00:00', tz='UTC')
+
+db <- 'data/zeg_pt_ec01.db'
+
+site_id <- 'zeg_pt_ec01'
+latlon <- c(52.139050, 4.838975)
 
 # Create the class and load the data
-pp = Postprocessing()
-pp$load_data(start_dt, end_dt, db=db_path)
+pp = Postprocessing$new(site_id = 'zeg_pt_ec01',
+                        latlon = latlon)
 
-# Fix WD
-pp$data = pp$data %>% 
-  mutate(WD = WD + 180,
-         WD = if_else(WD > 360, WD-360, WD))
+pp$load_data(start_dt, end_dt, db=db, variables = variables)
 
-glimpse(pp$data)
+# Add variables
+pp$data <- pp$data %>% 
+  mutate(VPD = 6.1078 * (1 - RELH/100) * exp(17.08085 * ATMP/(234.175 + ATMP)),
+         # Gapfill with data from meteo station
+         WD_GF = if_else(is.na(WD), WD_met, WD),
+         WS_GF = if_else(is.na(WS), WS_met, WS))
 ```
 
+## WD check
+
+Check agreement of sonic WD and met station
+
+```{r}
+ggplot(pp$data, aes(WD, WD_met)) +
+  geom_point() +
+  geom_abline(col='red') +
+  facet_wrap(~year)
+```
 
 ## Raw data
 
@@ -59,17 +89,265 @@ pp$data %>%
   pivot_longer(-datetime) %>% 
   ggplot(aes(datetime, value)) +
   geom_line() +
+  facet_wrap(~name, ncol=1, scales='free_y') +
+  scale_x_datetime(date_breaks = '2 months')
+```
+
+# Data filtering
+
+This step:
+
+- Removes poor quality data flagged by EddyPro
+
+### EddyPro Flags
+
+```{r}
+pp$data %>% 
+  select(datetime, CO2_SS, CH4_SS) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value, col=name)) +
+  geom_line() +
+  ylim(0, 100)
+```
+
+
+```{r}
+pp$filter_co2(vm97 = TRUE, CO2_SS_threshold = 70)
+pp$filter_ch4(vm97 = TRUE, CH4_SS_threshold = 10)
+```
+
+## Rain filter
+
+```{r}
+n <- nrow(pp$data)
+rain_idx <- which(pp$data$MT1_RAIN_1_H_040_Tot > 0)
+rain_idx <- unique(c(rain_idx, rain_idx+1))
+rain_idx <- 1:n %in% rain_idx
+rain_idx[is.na(pp$data$MT1_RAIN_1_H_040_Tot)] <- NA
+
+ggplot(pp$data, aes(datetime, FC_f, col=rain_idx)) +
+  geom_point()
+
+ggplot(pp$data, aes(datetime, FCH4_f, col=rain_idx)) +
+  geom_point()
+```
+
+```{r}
+pp$filter_rain()
+
+pp$data %>% 
+  select(datetime, FC_f, FCH4_f) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_point() +
   facet_wrap(~name, ncol=1, scales='free_y')
 ```
 
-## Data filtering
+## Filter outliers
 
-At the moment filtering is only done using Eddy Pro quality flags (QC flag == 1)
-and then outlier exclusion using simple quantile methods.
+Visually inspect the data and remove outliers
 
 ```{r}
-pp$filter_co2(ustar_threshold = 0.10)
-pp$filter_ch4()
+pp$data %>% 
+  select(datetime, FC_f, NEE_f) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_line() +
+  facet_wrap(~name, ncol = 1)
+
+pp$data %>% 
+  select(FC_f, NEE_f) %>% 
+  pivot_longer(everything()) %>% 
+  ggplot(aes(value)) +
+  geom_histogram() +
+  facet_wrap(~name)
+```
+
+```{r}
+summary(pp$data$FC_f)
+quantile(pp$data$FC_f, c(0, 0.0001, 0.001, 0.01), na.rm=TRUE)
+quantile(pp$data$FC_f, c(0.99, 0.995, 0.999, 0.99925, 0.9995, 0.9999, 1), na.rm=TRUE)
+
+min_q = 0.005
+max_q = 0.995
+
+pp$data %>% 
+  select(datetime, FC_f, NEE_f) %>% 
+  pivot_longer(-datetime) %>% 
+  group_by(name) %>% 
+  mutate(value = if_else(value <= quantile(value, min_q, na.rm=TRUE)  |
+                           value >= quantile(value, max_q, na.rm=TRUE)
+                         , NaN, value)) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_line()
+
+pp$data %>% 
+  select(FC_f, NEE_f) %>% 
+  pivot_longer(everything()) %>% 
+  group_by(name) %>% 
+  mutate(value = if_else(value < quantile(value, min_q, na.rm=TRUE)  |
+                           value > quantile(value, max_q, na.rm=TRUE)
+                         , NaN, value)) %>% 
+  ggplot(aes(value)) +
+  geom_histogram() +
+  facet_wrap(~name)
+```
+
+```{r}
+summary(pp$data$FCH4_f)
+quantile(pp$data$FCH4_f, c(0, 0.0001, 0.001, 0.01), na.rm=TRUE)
+quantile(pp$data$FCH4_f, c(0.99, 0.995, 0.999, 0.99925, 0.9995, 0.9999, 1), na.rm=TRUE)
+
+pp$data %>% 
+  select(datetime, FCH4_f) %>% 
+  mutate(FCH4_f = if_else(FCH4_f < quantile(FCH4_f, 0.005, na.rm=TRUE)  |
+                           FCH4_f > quantile(FCH4_f, 0.995, na.rm=TRUE),
+                          NaN, FCH4_f)) %>% 
+  ggplot(aes(datetime, FCH4_f)) +
+  geom_line()
+
+
+pp$data %>% 
+  select(datetime, FCH4_f) %>% 
+  mutate(FCH4_f = if_else(FCH4_f < quantile(FCH4_f, 0.005, na.rm=TRUE)  |
+                           FCH4_f > quantile(FCH4_f, 0.995, na.rm=TRUE),
+                          NaN, FCH4_f)) %>% 
+  ggplot(aes(FCH4_f)) +
+  geom_histogram()
+```
+
+```{r}
+pp$filter_outlier_co2(lower = min_q, upper = max_q)
+pp$filter_outlier_ch4(lower = min_q, upper = max_q)
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, FC_f, NEE_f, FCH4_f) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_line() +
+  facet_wrap(~name, ncol=1, scales='free_y') +
+  scale_x_datetime(date_breaks = '2 months')
+
+pp$data %>% 
+  select(FC_f, NEE_f, FCH4_f) %>% 
+  pivot_longer(everything()) %>% 
+  group_by(name) %>% 
+  ggplot(aes(value)) +
+  geom_histogram() +
+  facet_wrap(~name, scales='free_x')
+```
+
+### Manual spike removal
+
+```{r}
+summary(pp$data$NEE_f)
+summary(pp$data$FCH4_f)
+```
+
+```{r}
+# bad_ts <- as_datetime(c('2021-08-11 20:30:00',
+#                         '2022-01-15T10:00:00',
+#                         '2022-01-15 09:00:00',
+#                         '2022-01-15 07:30:00',
+#                         '2021-12-27 09:30:00'))
+
+# pp$data <- pp$data %>% 
+#   mutate(across(c(FC_f, NEE_f, FCH4_f), ~if_else(datetime %in% bad_ts, NaN, .x))) 
+# 
+# pp$data %>% 
+#   ggplot(aes(datetime, NEE_f)) +
+#   geom_line()
+# 
+# pp$data %>% 
+#   ggplot(aes(datetime, FCH4_f)) +
+#   geom_line()
+```
+
+### u* filtering
+
+- Estimates ustar threshold using the MPT method for FC/NEE via REddyProc
+  - Currently only a single threshold value is used rather than year/season
+  
+#### Check u\* flux relationships
+
+```{r}
+pp$data %>% 
+  select(USTAR, NEE_f, night, WD, SWIN) %>% 
+  filter(night == 1, SWIN < 5) %>% 
+  drop_na() %>% 
+  mutate(k = get_density(USTAR, NEE_f, 100)) %>% 
+  ggplot(aes(USTAR, NEE_f, col=k)) +
+  geom_point(alpha = 0.2) +
+  viridis::scale_color_viridis() +
+  ylim(-50, 50) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1))
+```
+
+```{r}
+pp$filter_ustar(min_ustar_threshold = 0.15)
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, USTAR, NEE_f, FCH4_f) %>% 
+  # mutate(across(c(NEE_f, FCH4_f), ~if_else(USTAR < 0.15, NaN, .x))) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_line() +
+  facet_wrap(~name, ncol=1, scales='free_y') +
+  scale_x_datetime(date_breaks = '2 months')
+```
+
+#### Post u* filter check
+
+```{r}
+pp$data %>% 
+  select(datetime, NEE_f, FCH4_f) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value)) +
+  geom_line() +
+  facet_wrap(~name, ncol=1, scales='free_y') +
+  scale_x_datetime(date_breaks = '2 months')
+```
+
+## Check data
+
+Check data coverage filtering
+
+```{r, fig.width=8, fig.height=4}
+pp$data %>% 
+  select(datetime, NEE_f) %>% 
+  mutate(hour = hour(datetime),
+         yday = yday(datetime)) %>% 
+  drop_na() %>% 
+  ggplot(aes(hour, yday, fill=NEE_f)) +
+  geom_tile() +
+  scale_y_continuous(breaks = yday(as_date('2021-01-01') %m+% months(0:11)),
+                     labels = month.abb,
+                     limits = c(0, 366),
+                     expand = c(0,0)) +
+  scale_x_continuous(breaks = seq(0, 22, 2), expand = c(0,0)) + 
+  viridis::scale_fill_viridis() +
+  labs(x='Hour', y='Month') +
+  facet_wrap(~year(datetime), nrow = 1)
+
+pp$data %>% 
+  select(datetime, FCH4_f) %>% 
+  mutate(hour = hour(datetime),
+         yday = yday(datetime)) %>% 
+  drop_na() %>% 
+  ggplot(aes(hour, yday, fill=FCH4_f)) +
+  geom_tile() +
+  scale_y_continuous(breaks = yday(as_date('2021-01-01') %m+% months(0:11)),
+                     labels = month.abb,
+                     limits = c(0, 366),
+                     expand = c(0,0)) +
+  scale_x_continuous(breaks = seq(0, 22, 2), expand = c(0,0)) + 
+  viridis::scale_fill_viridis() +
+  labs(x='Hour', y='Month') +
+  facet_wrap(~year(datetime), nrow = 1)
 ```
 
 ## Partition flux
@@ -78,7 +356,50 @@ pp$filter_ch4()
 pp$flux_partitioning(plot=TRUE)
 ```
 
-TODO: fix data gaps
+Lasslop et al. 2010 approach
+
+```{r}
+pp$flux_partitioning_ll(plot=TRUE)
+```
+
+Using REddyProc
+
+```{r}
+pp$flux_partitioning_eproc(plot=TRUE)
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, contains('eproc')) %>% 
+  pivot_longer(-datetime) %>% 
+  ggplot(aes(datetime, value, col=name)) +
+  geom_line()
+```
+
+### Comparison
+
+```{r}
+pp$data %>% 
+  select(datetime, GPP_ll, GPP, GPP_eproc) %>% 
+  mutate(GPP = -GPP) %>% 
+  pivot_longer(-datetime) %>% 
+  mutate(date = as_date(datetime-1)) %>% 
+  group_by(date, name) %>%
+  summarise(value = mean(value)) %>% 
+  ggplot(aes(date, value, col=name)) +
+  geom_line()
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, Reco_ll, Reco, Reco_eproc) %>% 
+  pivot_longer(-datetime) %>% 
+  mutate(date = as_date(datetime-1)) %>% 
+  group_by(date, name) %>%
+  summarise(value = mean(value)) %>% 
+  ggplot(aes(date, value, col=name)) +
+  geom_line()
+```
 
 ## Gapfilling
 
@@ -93,12 +414,53 @@ pp$gapfilling_nn()
 
 ```{r}
 pp$data %>% 
-  select(datetime, NEE, FC_GF_NLR, FC_GF_NN) %>% 
-  pivot_longer(-datetime) %>% 
-  mutate(year = year(datetime)) %>% 
+  select(year, datetime, NEE_f, NEE_GF_NLR, NEE_GF_NN) %>% 
+  add_row(datetime = as_datetime('2020-01-01T00:00:30'),
+          year = 2020) %>% 
+  add_row(datetime = as_datetime('2023-01-01T00:00:00'),
+          year = 2022) %>% 
+  pivot_longer(-c(year, datetime)) %>% 
+  mutate(name = factor(name, levels=c('NEE_GF_NLR', 'NEE_GF_NN', 'NEE_f'))) %>% 
   ggplot(aes(datetime, value, col=name)) +
   geom_line() +
   facet_wrap(~year, ncol=1, scales='free_x')
+```
+
+```{r}
+pp$data %>% 
+  select(datetime, NEE_GF_NN) %>% 
+  mutate(hour = hour(datetime),
+         yday = yday(datetime)) %>% 
+  drop_na() %>% 
+  ggplot(aes(hour, yday, fill=NEE_GF_NN)) +
+  geom_tile() +
+  scale_y_continuous(breaks = yday(as_date('2021-01-01') %m+% months(0:11)),
+                     labels = month.abb,
+                     limits = c(0, 366),
+                     expand = c(0,0)) +
+  scale_x_continuous(breaks = seq(0, 22, 2), expand = c(0,0)) + 
+  viridis::scale_fill_viridis() +
+  labs(x='Hour', y='Month') +
+  facet_wrap(~year(datetime), nrow = 1)
+```
+
+### Compare to REddyProc
+
+```{r}
+ggplot(pp$data) +
+  geom_line(aes(datetime, Reco, col='pp')) +
+  geom_line(aes(datetime, Reco_eproc, col='REddyProc'))
+```
+
+```{r}
+pp$data %>%
+  select(datetime, Reco, Reco_eproc) %>% 
+  mutate(datetime = floor_date(datetime, 'month')) %>% 
+  pivot_longer(-datetime) %>% 
+  group_by(datetime, name) %>% 
+  summarise(value = mean(value, na.rm=TRUE)) %>% 
+  ggplot(aes(datetime, value, col=name)) +
+  geom_point()
 ```
 
 ### CH4
@@ -138,17 +500,10 @@ pp$data %>%
   mutate(year = year(datetime)) %>% 
   ggplot() +
   geom_line(aes(datetime, FCH4_GF_RF, col='FCH4_GF_RF')) +
-  geom_line(aes(datetime, FCH4, col='FCH4')) +
+  geom_line(aes(datetime, FCH4_f, col='FCH4')) +
   labs(y = expression(value~'('*µmol.s^-1*.m^-2*')'), col=NULL) +
   facet_wrap(~year, ncol=1, scales='free_x')
 ```
-
-```{r}
-# Daily
-pp$data %>% 
-  select(datetime, FCH4_GF_RF)
-```
-
 
 ### Try and improve
 
@@ -182,37 +537,153 @@ pp$data %>%
 
 ```
 
+# Budgets
+
+Year-quarter budget
+
+```{r}
+daily_budget = pp$data %>% 
+  select(date = datetime, NEE_GF_NN, FCH4_GF_RF) %>% 
+  mutate(date = as_date(date)) %>%
+  group_by(date) %>% 
+  summarise(NEE_GF_NN = sum(NEE_GF_NN, na.rm=TRUE) / 10^6 * 44/1000 * 10^4 * 1800,
+            FCH4_GF_RF = sum(FCH4_GF_RF, na.rm=TRUE) / 10^6 * 16/1000 * 10^4 * 1800)
+
+yq_budget = daily_budget %>% 
+  mutate(year = year(date),
+         qtr = quarter(date)) %>% 
+  group_by(year, qtr) %>% 
+  summarise(across(c(NEE_GF_NN, FCH4_GF_RF), .fns=sum))
+
+knitr::kable(yq_budget)
+```
+
+Year budget
+
+```{r}
+yq_budget %>%
+  group_by(year) %>% 
+  summarise(across(c(NEE_GF_NN, FCH4_GF_RF), .fns=sum)) %>% 
+  knitr::kable()
+```
+
+```{r}
+daily_budget = pp$data %>% 
+  select(date = datetime, NEE_GF_NN, FCH4_GF_RF, GPP) %>% 
+  mutate(date = as_date(date)) %>%
+  group_by(date) %>% 
+  summarise(NEE_GF_NN = sum(NEE_GF_NN, na.rm=TRUE) / 10^6 * 44/1000 * 10^4 * 1800,
+            FCH4_GF_RF = sum(FCH4_GF_RF, na.rm=TRUE) / 10^6 * 16/1000 * 10^4 * 1800,
+            GPP = sum(GPP, na.rm=TRUE) / 10^6 * 44/1000 * 10^4 * 1800)
+
+yq_budget = daily_budget %>% 
+  mutate(year = year(date),
+         qtr = quarter(date)) %>% 
+  group_by(year, qtr) %>% 
+  summarise(across(c(NEE_GF_NN, FCH4_GF_RF), .fns=sum))
+
+knitr::kable(yq_budget)
+```
+
+Year budget
+
+```{r}
+yq_budget %>%
+  group_by(year) %>% 
+  summarise(across(c(NEE_GF_NN, FCH4_GF_RF), .fns=sum)) %>% 
+  knitr::kable()
+```
+
 # Contribution class
 
-This class uses the [Kljun et al. (2015)](https://doi.org/10.5194/gmd-8-3695-2015) 
-model to calculate the flux footprint. 
+This class uses the [Kljun et al. (2015)](https://doi.org/10.5194/gmd-8-3695-2015) model to calculate the flux footprint.
 
-Methods are available to calculate the percent contribution within area of
-interest and to return a timeseries raster brick.
+Methods are available to calculate the percent contribution within area of interest and to return a timeseries raster brick.
 
 ## Lisdodde
 
 ```{r}
-cb = Contribution(data = pp$data,
-                  xy = c(117467, 461350),
-                  epsg = 28992,
-                  shapefile = 'data/geodata/zegveld_lisdodde.kml')
+xy <-  st_point(rev(latlon)) %>% 
+  st_sfc(crs=4326) %>% 
+  st_transform(crs=28992) %>% 
+  st_coordinates() %>% 
+  as.vector()
+
+tmp = left_join(pp$data,
+          pbl %>% select(datetime=time, PBLH=pbl)) %>% 
+  filter(year==2020, month==9)
+
+cb = Contribution$new(data = tmp,
+                      xy = xy, #c(117467, 461350),
+                      epsg = 28992,
+                      shapefile = 'data/geodata/zegveld_2021_ge.gpkg')
+                      # kljun_params = list(domain = c(-200, 200,-200, 200),
+                      #                     nx = 401,
+#                                          ny = 401))
 ```
 
 ```{r}
 # The number of cores to use can be specified with parallel
-cb$calculate_contribution(keep_footprints = FALSE, parallel=6)
+cb$calculate_contribution(keep_footprints = TRUE, parallel = NULL)
 ```
 
 ```{r}
+cellStats(cb$footprints$X2020.09.01T00.30.00, 'mean')
+
+r = calc(cb$footprints[!is.na(cb$cdata$Contribution)], mean)
+
+tmp = calc(cb$footprints[[which(!is.na(cb$cdata$Contribution))]], mean)
+
+# Contour map
+raster::contour(tmp)
+
+```
+
+```{r}
+# Create mean raster from footprints
+r_mean = calc(cb$footprints[!is.na(cb$cdata$Contribution)], mean)
+r_mean = calc(cb$footprints[[which(!is.na(cb$cdata$Contribution))]], mean)
+
+f_sort <- sort(as.vector(r))
+f_cs <- cumsum(f_sort)
+rs <- seq(0.1, 0.8, 0.1)
+fr <- sapply(rs, function(r) {
+  diff <- abs(f_cs - r)
+  idx <- which.min(diff)
+  return(f_sort[idx])
+})
+
+r[r < 10^-15] <- NaN
+r_tbl <- as_tibble(raster::rasterToPoints(r))
+
+
+ggplot() +
+  geom_sf(data=s) +
+  geom_contour(data=r_tbl, aes(x, y, z=fp_example), breaks=fr) +
+  geom_raster(data=r_tbl, aes(x, y, z=fp_example, fill=fp_example, alpha=fp_example)) +
+  geom_sf(data=xy, aes(col='EC tower'), size=1) +
+  viridis::scale_fill_viridis(limits=c(0,NA)) +
+  scale_alpha_continuous(range = c(0.1, 1)) + 
+  scale_x_continuous(expand=c(0,0), limits=c(117400, 117500)) +
+  scale_y_continuous(expand=c(0,0), limits=c(461225, 461425)) +
+  coord_sf(datum=28992) +
+  labs(fill='Typha Contribution', col=NULL) +
+  guides(alpha='none') +
+  theme(axis.text.x = element_text(angle=90))
+```
+
+
+
+```{r}
 ggplot(cb$cdata, aes(WD, Contribution)) +
-  geom_point()
+  geom_point() +
+  ylim(0, 1)
 ```
 
 ```{r, warning=FALSE}
-pp$data %>% 
-  mutate(Contribution = cb$cdata$Contribution) %>% 
-  select(Contribution, FCH4, FC) %>% 
+left_join(cb$cdata,
+          pp$data %>% select(datetime, NEE_f, FCH4_f)) %>% 
+  select(Contribution, FCH4_f, NEE_f) %>% 
   pivot_longer(-Contribution) %>% 
   ggplot(aes(Contribution, value)) +
   geom_point() +
@@ -221,51 +692,128 @@ pp$data %>%
 
 # Upload to database
 
-Updates the database with some of the variables calculated e.g., NEE, GPP, 
-gap-filled series, contribution.
+Updates the database with some of the variables calculated e.g., NEE, GPP, gap-filled series, contribution.
 
 ```{r}
 pp$data <- pp$data %>% 
   mutate(Contribution = cb$cdata$Contribution)
 
-pp$upload_data(db=db_path, overwrite=TRUE)
+pp$upload_data(db=db,
+               variables = c('NEE_f', 'FCH4_f',
+                             'GPP', 'Reco',
+                             'nlr_NEE', 'nn_NEE',
+                             'NEE_GF_NLR', 'NEE_GF_NN',
+                             'FCH4_RF', 'FCH4_GF_RF',
+                             'GPP_ll', 'NEE_ll', 'Reco_ll',
+                             'Contribution',
+                             'NEE_eproc', 'GPP_eproc', 'Reco_eproc'),
+               overwrite=TRUE)
 ```
 
-## Grass east
+### FP of all data
 
 ```{r}
-cb_grass = Contribution(data = pp$data,
-                        xy = c(117467, 461350),
-                        epsg = 28992,
-                        shapefile = 'data/geodata/zegveld_grass_east.kml')
+cdata <- cb$cdata %>% 
+  drop_na()
+
+ffp <- calc_footprint_FFP_climatology(
+  zm = 3,
+  z0 = cdata$ROUGHNESS_LENGTH,
+  umean = cdata$WS,
+  h = cdata$PBLH,
+  ol = cdata$MO_LENGTH,
+  sigmav = cdata$V_SIGMA,
+  ustar = cdata$USTAR,
+  wind_dir = cdata$WD,
+  domain = c(-150, 150,-150, 150),
+  nx = 301,
+  ny = 301,
+  r = seq(10, 90, 10),
+  smooth_data = 1,
+  rslayer = 1,
+  fig = 1
+)
 ```
+
+## Fetch examination
+
+WD and WS polar plots
 
 ```{r}
-cb_grass$calculate_contribution(keep_footprints = FALSE, parallel = 4)
-```
+# WD frequency
+ggplot(pp$data, aes(WD)) +
+  geom_histogram(binwidth = 15, boundary=0) +
+  coord_polar() +
+  scale_x_continuous(limits = c(0,360),
+                     breaks = seq(0, 360, by = 45),
+                     minor_breaks = seq(0, 360, by = 15)) +
+  labs(x='Wind Direction', y='Frequency')
 
-```{r, warning=FALSE}
+
+ggplot(pp$data, aes(WS)) +
+  geom_histogram()
+
+# With WS
 pp$data %>% 
-  mutate(Contribution = cb_grass$cdata$Contribution) %>% 
-  select(Contribution, FCH4, FC) %>% 
-  pivot_longer(-Contribution) %>% 
-  ggplot(aes(Contribution, value)) +
-  geom_point() +
-  xlim(0, 1) + 
-  scale_y_continuous(expand=c(0.2, 0)) +
-  geom_smooth(method='lm') +
-  ggpmisc::stat_poly_eq(aes(label=paste(after_stat(eq.label), after_stat(adj.rr.label), sep = "*\", \"*"))) +
-  facet_wrap(~name, scales='free_y')
+  select(WS, WD) %>% 
+  drop_na() %>% 
+  mutate(WSbin = cut(WS, c(seq(0, 6, 1.5), Inf),
+                     right=FALSE),
+         WSbin = factor(WSbin, levels=rev(levels(WSbin)))) %>% 
+  ggplot(aes(WD, fill=WSbin)) +
+  geom_histogram(binwidth = 15, boundary=0) +
+  coord_polar() +
+  scale_x_continuous(limits = c(0,360),
+                     breaks = seq(0, 360, by = 45),
+                     minor_breaks = seq(0, 360, by = 15)) +
+  scale_fill_brewer('blues') +
+  labs(x='Wind Direction', y='Frequency')
 ```
 
-## Upload to database
-
-Updates the database with some of the variables calculated e.g., NEE, GPP, 
-gap-filled series, contribution.
+Mean fetch
 
 ```{r}
-pp$data <- pp$data %>% 
-  mutate(cb_grass = cb_grass$cdata$Contribution)
-
-pp$upload_data(db=db_path, variables='cb_grass')
+pp$data %>% 
+  filter(WS > 0) %>% 
+  select(WD, paste0('FETCH_', c(10, 30, 50, 70, 80, 90))) %>% 
+  drop_na() %>% 
+  mutate(WDbin = cut(WD, c(seq(0, 360, 1)),
+                     right=FALSE,
+                     include.lowest=TRUE)) %>% 
+  pivot_longer(-c(WD, WDbin)) %>% 
+  mutate(name = factor(name, labels=c(10, 30, 50, 70, 80, 90))) %>% 
+  group_by(WDbin, name) %>% 
+  summarise(WD = floor(min(WD)),
+            value = mean(value)) %>% 
+  ggplot(aes(WD, value, col=name)) +
+  geom_line() +
+  coord_polar() +
+  scale_x_continuous(limits = c(0,360),
+                     breaks = seq(0, 360, by = 45),
+                     minor_breaks = seq(0, 360, by = 15)) +
+  ylim(0, NA) +
+  labs(x='Wind direction [º]', y='Distance [m]', col='Fetch [%]')
 ```
+
+
+```{r}
+pp$data %>% 
+  filter(WS > 0) %>% 
+  # select(WD, paste0('FETCH_', c(10, 30, 50, 70, 80, 90))) %>% 
+  select(WD, FETCH_MAX) %>% 
+  drop_na() %>% 
+  #pivot_longer(-c(WD, WDbin)) %>% 
+  #mutate(name = factor(name, labels=c(10, 30, 50, 70, 80, 90))) %>% 
+  # group_by(WDbin, name) %>% 
+  mutate(k=get_density(WD, FETCH_MAX)) %>% 
+  ggplot(aes(WD, FETCH_MAX, col=k)) +
+  geom_point() +
+  coord_polar() +
+  viridis::scale_colour_viridis() +
+  scale_x_continuous(limits = c(0,360),
+                     breaks = seq(0, 360, by = 45),
+                     minor_breaks = seq(0, 360, by = 15)) +
+  ylim(0, NA) +
+  labs(x='Wind direction [º]', y='Distance [m]', col='k')
+```
+
